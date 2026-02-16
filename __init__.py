@@ -8,9 +8,11 @@
     "category": "Mesh",
 }
 
+
 def register():
     from . import loop_sculpt
     loop_sculpt.register()
+
 
 def unregister():
     from . import loop_sculpt
