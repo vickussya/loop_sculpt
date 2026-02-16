@@ -1,6 +1,9 @@
 name: Build Add-on Zip
 
 on:
+  push:
+    tags:
+      - "v*"
   release:
     types: [published]
   workflow_dispatch:
@@ -25,7 +28,9 @@ jobs:
           path: loop_sculpt.zip
 
       - name: Upload release asset
-        if: github.event_name == 'release'
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
           files: loop_sculpt.zip
