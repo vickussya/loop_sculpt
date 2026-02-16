@@ -191,28 +191,28 @@ def _clear_status(context):
 
 
 class LoopSculptSettings(PropertyGroup):
-    step: IntProperty(
+    step = IntProperty(
         name="Step",
         description="Dissolve every Nth loop",
         default=2,
         min=1,
         max=100,
     )
-    include_start: BoolProperty(
+    include_start = BoolProperty(
         name="Include Starting Loop",
         description="Allow dissolving the starting loop",
         default=False,
     )
-    limit_region: BoolProperty(
+    limit_region = BoolProperty(
         name="Limit to Connected Region",
         default=True,
     )
-    vg_name: StringProperty(
+    vg_name = StringProperty(
         name="Vertex Group",
         description="Only dissolve edges where both vertices are in this group",
         default="HAIR",
     )
-    vg_threshold: FloatProperty(
+    vg_threshold = FloatProperty(
         name="Weight Threshold",
         default=0.1,
         min=0.0,
@@ -229,7 +229,7 @@ class LoopSculptSettings(PropertyGroup):
                 items.append((str(idx), name, ""))
         return items
 
-    material_filter: EnumProperty(
+    material_filter = EnumProperty(
         name="Material",
         description="Only dissolve edges connected to faces with this material",
         items=_material_items,
@@ -241,7 +241,7 @@ class MESH_OT_loop_sculpt(Operator):
     bl_label = "Loop Sculpt"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
-    extend: IntProperty(default=0, min=0)
+    extend = IntProperty(default=0, min=0)
 
     def invoke(self, context, event):
         obj, bm = _active_bm(context)
