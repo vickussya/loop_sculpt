@@ -1,0 +1,31 @@
+name: Build Add-on Zip
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build zip
+        run: |
+          zip -r loop_sculpt.zip __init__.py loop_sculpt.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop_sculpt
+          path: loop_sculpt.zip
+
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: loop_sculpt.zip
