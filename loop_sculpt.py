@@ -180,6 +180,24 @@ def _clear_status(context):
         context.workspace.status_text_set(None)
 
 
+def _settings_from_context(context):
+    settings = getattr(context.scene, "loop_sculpt_settings", None)
+    if settings is None or type(settings).__name__ == "_PropertyDeferred":
+        return None
+    return settings
+
+
+def _snapshot_settings(settings):
+    return {
+        'step': int(settings.step),
+        'include_start': bool(settings.include_start),
+        'limit_region': bool(settings.limit_region),
+        'vg_name': str(settings.vg_name),
+        'vg_threshold': float(settings.vg_threshold),
+        'material_filter': str(settings.material_filter),
+    }
+
+
 class LoopSculptSettings(PropertyGroup):
     step = IntProperty(
         name="Step",
@@ -260,7 +278,10 @@ class MESH_OT_loop_sculpt(Operator):
             self.report({'WARNING'}, "No valid edge loop found")
             return {'CANCELLED'}
 
-        settings = context.scene.loop_sculpt_settings
+        settings = _settings_from_context(context)
+        if not settings:
+            self.report({'ERROR'}, "Loop Sculpt settings missing. Reinstall the add-on.")
+            return {'CANCELLED'}
 
         self._start_edge = start_edge
         self._base_loop = base_loop
@@ -269,14 +290,7 @@ class MESH_OT_loop_sculpt(Operator):
             'verts': {v for v in bm.verts if v.select},
             'faces': {f for f in bm.faces if f.select},
         }
-        self._settings_snapshot = {
-            'step': settings.step,
-            'include_start': settings.include_start,
-            'limit_region': settings.limit_region,
-            'vg_name': settings.vg_name,
-            'vg_threshold': settings.vg_threshold,
-            'material_filter': settings.material_filter,
-        }
+        self._settings_snapshot = _snapshot_settings(settings)
 
         self.extend = 0
         self._update_preview(context, bm)
@@ -286,7 +300,7 @@ class MESH_OT_loop_sculpt(Operator):
 
     def _status_text(self):
         s = self._settings_snapshot
-        return f"Loop Sculpt | Extend: {self.extend} | Step: {s['step']}"
+        return f"Loop Sculpt | Extend: {self.extend} | Step: {s.get('step', 1)}"
 
     def _candidate_loops(self, bm):
         loops = expand_loops(self._base_loop, self.extend)
@@ -295,9 +309,13 @@ class MESH_OT_loop_sculpt(Operator):
     def _edges_to_dissolve(self, context, bm):
         loops = self._candidate_loops(bm)
         s = self._settings_snapshot
+        try:
+            step = int(s.get('step', 1))
+        except (TypeError, ValueError):
+            step = 1
 
         candidates = []
-        if s['include_start']:
+        if s.get('include_start', False):
             candidates = loops
         else:
             candidates = loops[1:] if len(loops) > 1 else []
@@ -305,18 +323,18 @@ class MESH_OT_loop_sculpt(Operator):
         edges = set()
         if candidates:
             for idx, loop in enumerate(candidates):
-                if idx % max(1, s['step']) == 0:
+                if idx % max(1, step) == 0:
                     edges.update(loop)
 
         class _SettingsView:
             pass
         sv = _SettingsView()
-        sv.step = s['step']
-        sv.include_start = s['include_start']
-        sv.limit_region = s['limit_region']
-        sv.vg_name = s['vg_name']
-        sv.vg_threshold = s['vg_threshold']
-        sv.material_filter = s['material_filter']
+        sv.step = step
+        sv.include_start = bool(s.get('include_start', False))
+        sv.limit_region = bool(s.get('limit_region', True))
+        sv.vg_name = s.get('vg_name', "")
+        sv.vg_threshold = float(s.get('vg_threshold', 0.0))
+        sv.material_filter = s.get('material_filter', "NONE")
 
         return apply_filters(context, bm, edges, sv, self._start_edge)
 
@@ -375,10 +393,11 @@ class MESH_OT_loop_sculpt(Operator):
 
 
 class VIEW3D_PT_loop_sculpt(Panel):
-    bl_label = "Retopo Cleanup"
+    bl_label = "Loop Sculpt"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Edit"
+    bl_category = "Loop Sculpt"
+    bl_context = "mesh_edit"
 
     @classmethod
     def poll(cls, context):
@@ -387,7 +406,10 @@ class VIEW3D_PT_loop_sculpt(Panel):
 
     def draw(self, context):
         layout = self.layout
-        settings = context.scene.loop_sculpt_settings
+        settings = _settings_from_context(context)
+        if not settings:
+            layout.label(text="Settings missing; reinstall the add-on.")
+            return
 
         layout.operator(MESH_OT_loop_sculpt.bl_idname, text="Loop Sculpt (Ctrl+X)")
         layout.prop(settings, "step")
