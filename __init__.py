@@ -8,12 +8,7 @@
     "category": "Mesh",
 }
 
+from . import loop_sculpt
 
-def register():
-    from . import loop_sculpt
-    loop_sculpt.register()
-
-
-def unregister():
-    from . import loop_sculpt
-    loop_sculpt.unregister()
+register = loop_sculpt.register()
+unregister = loop_sculpt.unregister()
