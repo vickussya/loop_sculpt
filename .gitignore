@@ -197,3 +197,6 @@ pyrightconfig.json
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/blender,python,visualstudiocode
+
+# Add-on build artifacts
+loop_sculpt.zip

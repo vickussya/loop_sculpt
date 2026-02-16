@@ -9,8 +9,9 @@ Loop Sculpt is a Blender add-on designed to help artists clean up heavy topology
 - Undo-friendly, non-destructive preview
 
 ## Installation (Blender 3.6+ / 4.x)
-1. Make a ZIP that contains the `loop_sculpt` folder at the root of the ZIP.
-   - The ZIP should contain: `loop_sculpt/__init__.py` and `loop_sculpt/loop_sculpt.py`.
+1. Download `loop_sculpt.zip` from the GitHub Releases page.
+   - The ZIP contains: `__init__.py` and `loop_sculpt.py` at the top level.
+2. Note: the GitHub “Download ZIP” is **not** installable directly because GitHub wraps the repo in a `loop_sculpt-main/` folder, which Blender treats as an invalid module name.
 2. In Blender, go to **Edit > Preferences > Add-ons**.
 3. Click **Install...** and select the ZIP file.
 4. Enable the add-on by checking **Loop Sculpt** in the add-ons list.

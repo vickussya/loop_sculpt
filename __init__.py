@@ -8,6 +8,6 @@
     "category": "Mesh",
 }
 
-from .loop_sculpt import register, unregister
+from loop_sculpt import register, unregister
 
 __all__ = ["register", "unregister"]
