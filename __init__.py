@@ -1,4 +1,4 @@
-﻿bl_info = {
+bl_info = {
     "name": "Loop Sculpt",
     "author": "vickussya",
     "version": (1, 0, 0),
