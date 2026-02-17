@@ -1,6 +1,7 @@
 import bpy
 import bmesh
 import math
+import mathutils
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import BoolProperty, IntProperty, PointerProperty
 
@@ -71,6 +72,22 @@ def _loop_centroid(loop_edges):
     if total is None or count == 0:
         return None
     return total / count
+
+
+def _representative_edge(edges):
+    if not edges:
+        return None
+    preferred = None
+    for e in edges:
+        if len(e.link_faces) != 2:
+            continue
+        for f in e.link_faces:
+            if len(f.verts) == 4:
+                preferred = e
+                break
+        if preferred:
+            break
+    return preferred if preferred else next(iter(edges))
 
 
 def _deselect_all(bm):
@@ -297,6 +314,12 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("invoke: cancelled (selection invalid: %s)" % reason)
             return {'CANCELLED'}
 
+        base_rep = _representative_edge(selected_edges)
+        if not base_rep:
+            self.report({'ERROR'}, "No valid edge found in selection")
+            _debug_log("invoke: cancelled (no representative edge)")
+            return {'CANCELLED'}
+
         self._base_loop_keys = _loop_keys(selected_edges)
         self._orig_sel = {
             'edges': {e for e in bm.edges if e.select},
@@ -309,7 +332,6 @@ class MESH_OT_loop_sculpt(Operator):
         self._protect_angle_deg = settings.protect_angle_deg if settings else 45
         self._disable_protection = settings.disable_protection if settings else False
 
-        base_rep = _representative_edge(selected_edges)
         ring_edges = _get_ring_edges_from_seed(bm, obj, self._area, self._region, self._win, base_rep)
         if not ring_edges:
             self.report({'ERROR'}, "Edge ring not found for base loop")
