@@ -65,44 +65,6 @@ def _opposite_edge_in_face(face, edge):
     return None
 
 
-def _walk_loop_from_face(edge, face):
-    if len(face.verts) != 4:
-        return []
-    loop_edges = []
-    curr_edge = edge
-    curr_face = face
-    visited = set()
-    while True:
-        opp = _opposite_edge_in_face(curr_face, curr_edge)
-        if not opp or opp in visited:
-            break
-        loop_edges.append(opp)
-        visited.add(opp)
-        next_face = None
-        for f in opp.link_faces:
-            if f is curr_face:
-                continue
-            if len(f.verts) == 4:
-                next_face = f
-                break
-        if not next_face:
-            break
-        curr_edge, curr_face = opp, next_face
-        if curr_edge is edge:
-            break
-    return loop_edges
-
-
-def build_edge_loop(edge):
-    # Manual quad loop walk, robust enough for preview.
-    loop = {edge}
-    for f in edge.link_faces:
-        if len(f.verts) != 4:
-            continue
-        loop.update(_walk_loop_from_face(edge, f))
-    return loop
-
-
 def _deselect_all(bm):
     for e in bm.edges:
         e.select = False
@@ -239,19 +201,13 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("invoke: cancelled (selection too small)")
             return {'CANCELLED'}
 
-        start_edge = selected_edges[0]
-        base_loop = build_edge_loop(start_edge)
-        if not base_loop or len(base_loop) < 2:
-            self.report({'ERROR'}, "Select a full edge loop")
-            _debug_log("invoke: cancelled (no valid loop)")
-            return {'CANCELLED'}
         ok, reason = _validate_loop_edges(selected_edges)
         if not ok:
             self.report({'ERROR'}, "Selection must be a single edge loop")
             _debug_log("invoke: cancelled (selection invalid: %s)" % reason)
             return {'CANCELLED'}
 
-        self._base_loop_keys = _loop_keys(base_loop)
+        self._base_loop_keys = _loop_keys(selected_edges)
         self._orig_sel = {
             'edges': {e for e in bm.edges if e.select},
             'verts': {v for v in bm.verts if v.select},
@@ -261,7 +217,7 @@ class MESH_OT_loop_sculpt(Operator):
         self.extend = 0
         _status(context, self._status_text())
         context.window_manager.modal_handler_add(self)
-        _debug_log("invoke: running (base_loop_edges=%d)" % len(self._base_loop_keys))
+        _debug_log("invoke: running (base_loop_edges=%d valid=%s)" % (len(self._base_loop_keys), ok))
         return {'RUNNING_MODAL'}
 
     def _status_text(self):
@@ -306,6 +262,8 @@ class MESH_OT_loop_sculpt(Operator):
 
     def modal(self, context, event):
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
+            if context.area and context.area.type != 'VIEW_3D':
+                return {'RUNNING_MODAL'}
             self.extend += 1
             obj, bm = _active_bm(context)
             if not bm:
@@ -316,15 +274,17 @@ class MESH_OT_loop_sculpt(Operator):
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
                 self.report({'WARNING'}, "Topology limits loop traversal; cannot extend further")
-                _debug_log("wheel up: cancelled (edge data changed)")
+                _debug_log("wheel up: blocked (topology limit)")
                 _clear_status(context)
                 self.extend = max(0, self.extend - 1)
                 return {'RUNNING_MODAL'}
             _status(context, self._status_text())
-            _debug_log("wheel up: extend=%d" % self.extend)
+            _debug_log("wheel up: extend=%d added=%d" % (self.extend, self.extend))
             return {'RUNNING_MODAL'}
 
         if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS'}:
+            if context.area and context.area.type != 'VIEW_3D':
+                return {'RUNNING_MODAL'}
             self.extend = max(0, self.extend - 1)
             obj, bm = _active_bm(context)
             if not bm:
@@ -335,23 +295,20 @@ class MESH_OT_loop_sculpt(Operator):
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
                 self.report({'WARNING'}, "Topology limits loop traversal; cannot shrink further")
-                _debug_log("wheel down: cancelled (edge data changed)")
+                _debug_log("wheel down: blocked (topology limit)")
                 _clear_status(context)
                 return {'RUNNING_MODAL'}
             _status(context, self._status_text())
-            _debug_log("wheel down: extend=%d" % self.extend)
+            _debug_log("wheel down: extend=%d removed=%d" % (self.extend, self.extend))
             return {'RUNNING_MODAL'}
 
         if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'}:
-            return {'RUNNING_MODAL'}
-
-        if event.type in {'RIGHTMOUSE'}:
             _clear_status(context)
             self.report({'INFO'}, "Loop Sculpt finished; selection kept")
-            _debug_log("finish: selection kept")
+            _debug_log("finish: leftmouse")
             return {'FINISHED'}
 
-        if event.type in {'ESC'}:
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
             obj, bm = _active_bm(context)
             if bm:
                 base_loop = _edges_from_keys(bm, self._base_loop_keys)
@@ -364,8 +321,8 @@ class MESH_OT_loop_sculpt(Operator):
                     _restore_selection(bm, self._orig_sel)
                     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
             _clear_status(context)
-            self.report({'INFO'}, "Loop Sculpt cancelled; selection restored")
-            _debug_log("cancel: restored selection")
+            self.report({'INFO'}, "Loop Sculpt cancelled; base loop restored")
+            _debug_log("cancel: %s" % event.type)
             return {'CANCELLED'}
 
         return {'RUNNING_MODAL'}

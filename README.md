@@ -1,12 +1,11 @@
-﻿# Loop Sculpt
+# Loop Sculpt
 
-Loop Sculpt is a Blender add-on designed to help artists clean up heavy topology faster without ruining the form of the mesh. It is best for cases where you need extra loop cuts to shape the form, then reduce the loop count to make rendering easier. It is especially helpful for dense meshes such as hair. The add-on was created from real-world modeling experience with the goal of speeding up the workflow.
+Loop Sculpt is a selection-only Blender add-on for stepping edge loop selection in Edit Mode.
 
 ## Features
-- Modal edge-loop dissolve controlled by mouse wheel
-- Step-based dissolve (e.g., dissolve every other loop)
-- Filters for hair-only workflows (vertex group, material, connected region)
-- Undo-friendly, non-destructive preview
+- Selection-only loop stepping (no geometry changes)
+- Mouse wheel adds/removes loops with skip-one spacing
+- UI button activation (no shortcuts)
 
 ## Installation (Blender 3.6+ / 4.x)
 1. Download `loop_sculpt.zip` from the GitHub Releases page.
@@ -18,8 +17,14 @@ Loop Sculpt is a Blender add-on designed to help artists clean up heavy topology
 
 ## Usage
 1. Enter **Edit Mode** on a mesh and use **Edge Select**.
-2. Select a single edge that belongs to an edge loop.
-3. Press **Ctrl+X** to start the modal tool.
-4. Use the mouse wheel to increase/decrease the number of loops previewed.
-5. Confirm with **Left Mouse** or **Enter**, or cancel with **Right Mouse** / **Esc**.
-6. Settings and filters are available in **View3D > Sidebar > Edit > Retopo Cleanup**.
+2. Alt+Click to select a single edge loop.
+3. Open **View3D > Sidebar > Loop Sculpt** and click **Loop Sculpt**.
+4. Hover the mouse over the 3D Viewport and use the mouse wheel:
+   - Wheel Up: add one loop using skip-one spacing.
+   - Wheel Down: remove one added loop.
+5. Confirm with **Left Mouse** (selection stays).
+6. Cancel with **Esc** or **Right Mouse** (selection returns to the original loop).
+
+## Notes
+- Best on quad-based topology.
+- The tool only changes selection; it never modifies geometry.
