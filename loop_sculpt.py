@@ -468,6 +468,7 @@ class MESH_OT_loop_sculpt(Operator):
         edge_map = _edge_by_key(bm)
 
         selected = []
+        blocked_current = False
 
         _debug_log("event: %s" % event_name)
         _debug_log("base_i=%d total_loops=%d" % (base_index, len(loops)))
