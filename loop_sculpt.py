@@ -67,11 +67,12 @@ def _opposite_edge_in_face(face, edge):
     return None
 
 
-def _is_border_loop(loop_edges):
-    for e in loop_edges:
-        if len(e.link_faces) < 2:
-            return True
-    return False
+def _is_boundary_edge(edge):
+    return len(edge.link_faces) != 2
+
+
+def _loop_is_boundary(loop_edges):
+    return any(_is_boundary_edge(e) for e in loop_edges)
 
 
 def _deselect_all(bm):
@@ -175,7 +176,7 @@ def _neighbor_loops(bm, loop_edges):
     valid = []
     for comp in components:
         ok, _reason = _validate_loop_edges(comp)
-        if ok and not _is_border_loop(comp):
+        if ok:
             valid.append(comp)
     valid.sort(key=lambda c: sorted(_loop_keys(c))[0])
     return valid
@@ -262,54 +263,82 @@ class MESH_OT_loop_sculpt(Operator):
         if not base_loop:
             return None
 
-        selected_loops = [base_loop]
-        if step == 0:
-            _debug_log("loops: step=0 sizes=[%d]" % len(base_loop))
-            return set(base_loop)
-
         hop = self._skip_loops + 1
-        side_loops = _neighbor_loops(bm, base_loop)
-        blocked_a = False
-        blocked_b = False
+        neighbors = _neighbor_loops(bm, base_loop)
+        side_loops = []
+        for loop in neighbors:
+            if not _loop_is_boundary(loop):
+                side_loops.append(loop)
+            if len(side_loops) == 2:
+                break
 
-        for side_index in range(2):
-            if side_index >= len(side_loops):
-                if side_index == 0:
-                    blocked_a = True
+        selected_loops = [base_loop]
+        side_selected = [None, None]
+        blocked = [False, False]
+
+        for k in range(1, step + 1):
+            target_dist = hop * k
+            for side_index in range(2):
+                if blocked[side_index]:
+                    continue
+                if side_index >= len(side_loops):
+                    blocked[side_index] = True
+                    continue
+                if k == 1:
+                    prev = base_loop
+                    curr = side_loops[side_index]
                 else:
-                    blocked_b = True
-                continue
-            prev = base_loop
-            curr = side_loops[side_index]
-            target_dist = hop * step
-            for _dist in range(1, target_dist):
-                nxt = _next_loop(bm, prev, curr)
-                if not nxt:
-                    curr = None
-                    break
-                prev, curr = curr, nxt
-            if not curr:
-                if side_index == 0:
-                    blocked_a = True
-                else:
-                    blocked_b = True
-                continue
-            if _is_border_loop(curr):
-                if side_index == 0:
-                    blocked_a = True
-                else:
-                    blocked_b = True
-                continue
-            selected_loops.append(curr)
+                    prev = side_selected[side_index]
+                    curr = side_selected[side_index]
+                if not curr:
+                    blocked[side_index] = True
+                    continue
+                prev_loop = base_loop
+                curr_loop = side_loops[side_index]
+                if k > 1:
+                    prev_loop = side_selected[side_index]
+                    curr_loop = side_selected[side_index]
+                steps_needed = target_dist
+                if k > 1:
+                    steps_needed = hop
+                for _dist in range(1, steps_needed):
+                    nxt = _next_loop(bm, prev_loop, curr_loop)
+                    if not nxt:
+                        curr_loop = None
+                        break
+                    prev_loop, curr_loop = curr_loop, nxt
+                if not curr_loop:
+                    blocked[side_index] = True
+                    continue
+                if _loop_is_boundary(curr_loop):
+                    blocked[side_index] = True
+                    continue
+                side_selected[side_index] = curr_loop
+            if blocked[0] and blocked[1]:
+                break
+
+        for loop in side_selected:
+            if loop:
+                selected_loops.append(loop)
 
         edges = set()
         for loop in selected_loops:
             edges.update(loop)
+
         _debug_log(
-            "loops: step=%d sizes=%s" %
-            (step, [len(loop) for loop in selected_loops])
+            "loops: skip=%d hop=%d base=%d boundary=%s sideA=%s sideB=%s selectedA=%s selectedB=%s" % (
+                self._skip_loops,
+                hop,
+                len(base_loop),
+                _loop_is_boundary(base_loop),
+                len(side_loops[0]) if len(side_loops) > 0 else 0,
+                len(side_loops[1]) if len(side_loops) > 1 else 0,
+                len(side_selected[0]) if side_selected[0] else 0,
+                len(side_selected[1]) if side_selected[1] else 0,
+            )
         )
-        if blocked_a and blocked_b:
+
+        if blocked[0] and blocked[1] and step > 0:
             return None
         return edges
 
