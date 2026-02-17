@@ -3,7 +3,7 @@ import bmesh
 import math
 import mathutils
 from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import BoolProperty, IntProperty, PointerProperty
+from bpy.props import BoolProperty, IntProperty, PointerProperty, FloatProperty
 
 
 def _active_bm(context):
@@ -306,13 +306,12 @@ class LoopSculptSettings(PropertyGroup):
         min=1,
         max=5,
     )
-    protect_angle_deg: IntProperty(
+    protect_angle_deg: FloatProperty(
         name="Protect Angle",
         description="Edges with face angle >= this value are treated as silhouette and will not be selected",
         default=45,
         min=1,
         max=89,
-        subtype='ANGLE',
     )
     disable_protection: BoolProperty(
         name="Disable Protection (Debug)",
@@ -485,23 +484,24 @@ class MESH_OT_loop_sculpt(Operator):
         chosen_indices = [base_index]
         blocked = []
 
-        def maybe_add(idx, side_label):
+        def idx_status(idx):
             if idx < 0 or idx >= len(loops):
-                blocked.append((idx, "out_of_range"))
-                return False
+                return "out_of_range"
             if hop > 1 and abs(idx - base_index) % hop != 0:
-                blocked.append((idx, "adjacency_guard"))
-                return False
-            loop = loops[idx]
-            if self._disable_protection:
-                selected.append(loop)
-                return True
-            protected = _loop_is_protected(loop, edge_map, self._protect_angle_deg)
-            if protected:
-                blocked.append((idx, "protected"))
-                return False
-            selected.append(loop)
-            return True
+                return "adjacency_guard"
+            if not self._disable_protection:
+                loop = loops[idx]
+                if _loop_is_protected(loop, edge_map, self._protect_angle_deg):
+                    return "protected"
+            return "selected"
+
+        def maybe_add(idx):
+            status = idx_status(idx)
+            if status == "selected":
+                selected.append(loops[idx])
+                return True, status
+            blocked.append((idx, status))
+            return False, status
 
         added_a = False
         added_b = False
@@ -512,8 +512,8 @@ class MESH_OT_loop_sculpt(Operator):
             idx_pos = base_index + k * hop
             idx_neg = base_index - k * hop
             chosen_indices.extend([idx_pos, idx_neg])
-            added_pos = maybe_add(idx_pos, "right")
-            added_neg = maybe_add(idx_neg, "left")
+            added_pos, _ = maybe_add(idx_pos)
+            added_neg, _ = maybe_add(idx_neg)
             if added_pos:
                 added_b = True
             if added_neg:
@@ -526,12 +526,15 @@ class MESH_OT_loop_sculpt(Operator):
         _debug_log("hop=%d step_count=%d" % (hop, step_count))
         _debug_log("chosen_indices=%s" % sorted(set(chosen_indices)))
         _debug_log("base_i=%d total_loops=%d" % (base_index, len(loops)))
-        selected_indices = sorted({base_index} | {base_index + k * hop for k in range(1, step_count + 1)} | {base_index - k * hop for k in range(1, step_count + 1)})
+        selected_indices = [base_index]
+        for k in range(1, step_count + 1):
+            selected_indices.extend([base_index + k * hop, base_index - k * hop])
+        selected_indices = sorted(dict.fromkeys(selected_indices))
         _debug_log("selected_indices=%s" % selected_indices)
         for idx in selected_indices:
-            if 0 <= idx < len(loops):
-                proj = self._ordered_projections[idx] if hasattr(self, "_ordered_projections") else 0.0
-                _debug_log("idx=%d proj=%.6f" % (idx, proj))
+            status = idx_status(idx)
+            proj = self._ordered_projections[idx] if 0 <= idx < len(loops) and hasattr(self, "_ordered_projections") else 0.0
+            _debug_log("idx=%d proj=%.6f status=%s" % (idx, proj, status))
         for idx, reason in blocked:
             _debug_log("blocked idx=%s reason=%s" % (idx, reason))
 
@@ -562,8 +565,6 @@ class MESH_OT_loop_sculpt(Operator):
             next_step = self._step_count + 1
             idx_left = self._base_index - next_step * hop
             idx_right = self._base_index + next_step * hop
-            in_left = 0 <= idx_left < len(self._ordered_loops)
-            in_right = 0 <= idx_right < len(self._ordered_loops)
             obj, bm = _active_bm(context)
             if not bm:
                 self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
@@ -572,8 +573,14 @@ class MESH_OT_loop_sculpt(Operator):
             bm.edges.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             edge_map = _edge_by_key(bm)
+            in_left = 0 <= idx_left < len(self._ordered_loops)
+            in_right = 0 <= idx_right < len(self._ordered_loops)
             left_protected = False
             right_protected = False
+            if in_left and hop > 1 and abs(idx_left - self._base_index) % hop != 0:
+                in_left = False
+            if in_right and hop > 1 and abs(idx_right - self._base_index) % hop != 0:
+                in_right = False
             if in_left and not self._disable_protection:
                 left_protected = _loop_is_protected(self._ordered_loops[idx_left], edge_map, self._protect_angle_deg)
             if in_right and not self._disable_protection:
