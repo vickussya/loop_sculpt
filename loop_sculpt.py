@@ -420,6 +420,7 @@ class MESH_OT_loop_sculpt(Operator):
         max_left = base_index
         max_right = (len(self._ordered_loops) - 1) - base_index
         self._max_steps = max(max_left, max_right) // hop
+        self._notified_limit = False
 
         self.extend = 0
         _status(context, self._status_text())
@@ -471,6 +472,7 @@ class MESH_OT_loop_sculpt(Operator):
         added_b = False
         added_current_a = False
         added_current_b = False
+        blocked_current = False
         for k in range(1, step_count + 1):
             idx_pos = base_index + k * hop
             idx_neg = base_index - k * hop
@@ -484,6 +486,7 @@ class MESH_OT_loop_sculpt(Operator):
             if k == step_count:
                 added_current_b = added_pos
                 added_current_a = added_neg
+                blocked_current = not added_pos and not added_neg
 
         _debug_log("hop=%d step_count=%d" % (hop, step_count))
         _debug_log("chosen_indices=%s" % chosen_indices)
@@ -491,8 +494,10 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("blocked idx=%d" % idx)
 
         if event_name in {"WHEELUP", "WHEELDOWN"} and not self._disable_protection:
-            if step_count > 0 and not added_current_a and not added_current_b:
-                self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
+            if step_count > 0 and blocked_current:
+                if not self._notified_limit:
+                    self.report({'INFO'}, "Reached silhouette; further expansion blocked on one or both sides.")
+                    self._notified_limit = True
 
         edges = set()
         for loop in selected:
@@ -513,7 +518,40 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("EVENT: %s %s" % (event.type, event.value))
 
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
-            self._step_count = min(self._step_count + 1, self._max_steps)
+            hop = self._skip_loops + 1
+            next_step = self._step_count + 1
+            idx_left = self._base_index - next_step * hop
+            idx_right = self._base_index + next_step * hop
+            in_left = 0 <= idx_left < len(self._ordered_loops)
+            in_right = 0 <= idx_right < len(self._ordered_loops)
+            obj, bm = _active_bm(context)
+            if not bm:
+                self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
+                return {'RUNNING_MODAL'}
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            edge_map = _edge_by_key(bm)
+            left_protected = False
+            right_protected = False
+            if in_left and not self._disable_protection:
+                left_protected = _loop_is_protected(self._ordered_loops[idx_left], edge_map, self._protect_angle_deg)
+            if in_right and not self._disable_protection:
+                right_protected = _loop_is_protected(self._ordered_loops[idx_right], edge_map, self._protect_angle_deg)
+            left_ok = in_left and (self._disable_protection or not left_protected)
+            right_ok = in_right and (self._disable_protection or not right_protected)
+
+            _debug_log("limit_check: attempted_step=%d" % next_step)
+            _debug_log("idx_left: in_range=%s protected=%s" % (in_left, left_protected))
+            _debug_log("idx_right: in_range=%s protected=%s" % (in_right, right_protected))
+
+            if not left_ok and not right_ok:
+                if not self._notified_limit:
+                    self.report({'INFO'}, "Reached silhouette; further expansion blocked on one or both sides.")
+                    self._notified_limit = True
+                return {'RUNNING_MODAL'}
+
+            self._step_count = min(next_step, self._max_steps)
             obj, bm = _active_bm(context)
             if not bm:
                 self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
@@ -527,6 +565,7 @@ class MESH_OT_loop_sculpt(Operator):
 
         if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS'}:
             self._step_count = max(0, self._step_count - 1)
+            self._notified_limit = False
             obj, bm = _active_bm(context)
             if not bm:
                 self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
