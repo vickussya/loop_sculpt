@@ -299,21 +299,21 @@ def _edges_share_ring_vertices(loop_edges, ring_edges):
 
 
 class LoopSculptSettings(PropertyGroup):
-    skip_loops: IntProperty(
+    skip_loops: int = IntProperty(
         name="Skip Loops",
         description="Number of loops to skip between selected loops",
         default=1,
         min=1,
         max=5,
     )
-    protect_angle_deg: FloatProperty(
+    protect_angle_deg: float = FloatProperty(
         name="Protect Angle",
         description="Edges with face angle >= this value are treated as silhouette and will not be selected",
         default=45,
         min=1,
         max=89,
     )
-    disable_protection: BoolProperty(
+    disable_protection: bool = BoolProperty(
         name="Disable Protection (Debug)",
         description="Ignore silhouette protection for debugging",
         default=False,
@@ -325,7 +325,7 @@ class MESH_OT_loop_sculpt(Operator):
     bl_label = "Loop Sculpt"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
-    extend: IntProperty(default=0, min=0)
+    extend: int = IntProperty(default=0, min=0)
 
     def invoke(self, context, event):
         obj, bm = _active_bm(context)
