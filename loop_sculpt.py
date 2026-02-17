@@ -198,7 +198,7 @@ def _validate_loop_edges(edges):
     return True, ""
 
 
-def _get_loop_from_seed_edge(bm, obj, area, region, seed_edge):
+def _get_loop_from_seed_edge(bm, obj, area, region, window, seed_edge):
     original = {e for e in bm.edges if e.select}
     _deselect_all(bm)
     seed_edge.select = True
@@ -207,6 +207,7 @@ def _get_loop_from_seed_edge(bm, obj, area, region, seed_edge):
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
     with bpy.context.temp_override(
+        window=window,
         area=area,
         region=region,
         active_object=obj,
@@ -226,7 +227,7 @@ def _get_loop_from_seed_edge(bm, obj, area, region, seed_edge):
     return loop
 
 
-def _adjacent_loop_on_side(bm, obj, area, region, loop_edges, seed_face_index, prev_loop):
+def _adjacent_loop_on_side(bm, obj, area, region, window, loop_edges, seed_face_index, prev_loop):
     seed_face = None
     for f in bm.faces:
         if f.index == seed_face_index:
@@ -252,7 +253,7 @@ def _adjacent_loop_on_side(bm, obj, area, region, loop_edges, seed_face_index, p
     if not opp:
         return None, None, None
 
-    loop = _get_loop_from_seed_edge(bm, obj, area, region, opp)
+    loop = _get_loop_from_seed_edge(bm, obj, area, region, window, opp)
     if not loop:
         return None, None, None
 
@@ -299,6 +300,7 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("invoke: cancelled (no edit mesh)")
             return {'CANCELLED'}
 
+        self._win = context.window
         self._area = context.area
         self._region = context.region
 
@@ -308,8 +310,8 @@ class MESH_OT_loop_sculpt(Operator):
 
         selected_edges = [e for e in bm.edges if e.select]
         _debug_log(
-            "invoke: mode=%s obj=%s selected_edges=%d" %
-            (context.mode, obj.name if obj else "None", len(selected_edges))
+            "invoke: mode=%s area=%s region=%s selected_edges=%d" %
+            (context.mode, self._area.type if self._area else None, self._region.type if self._region else None, len(selected_edges))
         )
         if len(selected_edges) < 2:
             self.report({'ERROR'}, "Select a full edge loop (at least 2 edges)")
@@ -344,7 +346,7 @@ class MESH_OT_loop_sculpt(Operator):
         self.extend = 0
         _status(context, self._status_text())
         context.window_manager.modal_handler_add(self)
-        _debug_log("invoke: running (base_loop_edges=%d valid=%s)" % (len(self._base_loop_keys), ok))
+        _debug_log("invoke: base_loop_edges=%d" % len(self._base_loop_keys))
         return {'RUNNING_MODAL'}
 
     def _status_text(self):
@@ -353,7 +355,7 @@ class MESH_OT_loop_sculpt(Operator):
     def _edges_for_step(self, bm, obj, step, event_name):
         base_loop = _edges_from_keys(bm, self._base_loop_keys)
         if not base_loop:
-            return None
+            return None, "Base loop not found"
 
         hop = self._skip_loops + 1
 
@@ -372,6 +374,7 @@ class MESH_OT_loop_sculpt(Operator):
 
         side_faces = [self._sideA_face_index, self._sideB_face_index]
         side_counts = [0, 0]
+        fail_reason = None
 
         for side_index in range(2):
             if side_faces[side_index] < 0:
@@ -390,12 +393,14 @@ class MESH_OT_loop_sculpt(Operator):
                         obj,
                         self._area,
                         self._region,
+                        self._win,
                         curr_loop,
                         side_faces[side_index],
                         prev_loop,
                     )
                     if not nxt_loop:
                         blocked[side_index] = True
+                        fail_reason = "No adjacent loop found (topology/strip detection failed)"
                         break
                     prev_loop = curr_loop
                     curr_loop = nxt_loop
@@ -410,10 +415,9 @@ class MESH_OT_loop_sculpt(Operator):
             protected = False
             sample_edges = []
             sample_angles = []
-            if final_loop:
-                if not self._disable_protection:
-                    protected = _loop_is_protected(final_loop, self._protect_angle_deg)
-                    sample_edges, sample_angles = _sample_protected(final_loop, self._protect_angle_deg)
+            if final_loop and not self._disable_protection:
+                protected = _loop_is_protected(final_loop, self._protect_angle_deg)
+                sample_edges, sample_angles = _sample_protected(final_loop, self._protect_angle_deg)
 
             _debug_log("side%s_attempt:" % ("A" if side_index == 0 else "B"))
             _debug_log("    final_loop_edges=%d, protected=%s" % (
@@ -433,6 +437,8 @@ class MESH_OT_loop_sculpt(Operator):
                 added[side_index] = True
                 side_counts[side_index] += 1
             else:
+                if not self._disable_protection and protected:
+                    fail_reason = "Reached protected silhouette loop"
                 blocked[side_index] = True
 
         edges = set()
@@ -448,41 +454,44 @@ class MESH_OT_loop_sculpt(Operator):
         self._last_added = added
 
         if blocked[0] and blocked[1] and step > 0:
-            return None
-        return edges
+            return None, fail_reason or "No adjacent loop found (topology/strip detection failed)"
+        return edges, None
 
     def _update_preview(self, context, bm, obj, event_name):
-        edges = self._edges_for_step(bm, obj, self.extend, event_name)
+        edges, err = self._edges_for_step(bm, obj, self.extend, event_name)
         if edges is None:
-            return False
+            return False, err
         if not edges:
-            return True
+            return True, None
         _deselect_all(bm)
         for e in edges:
             if e.is_valid:
                 e.select = True
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-        return True
+        return True, None
 
     def modal(self, context, event):
-        if context.area != self._area:
-            return {'RUNNING_MODAL'}
+        if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'LEFTMOUSE', 'ESC', 'RIGHTMOUSE'}:
+            _debug_log("EVENT: %s %s" % (event.type, event.value))
 
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
-            if context.area and context.area.type != 'VIEW_3D':
-                return {'RUNNING_MODAL'}
             self.extend += 1
             obj, bm = _active_bm(context)
             if not bm:
-                _debug_log("wheel up: cancelled (no edit mesh)")
-                return {'CANCELLED'}
+                self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
+                return {'RUNNING_MODAL'}
             bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            if not self._update_preview(context, bm, obj, "WHEELUP"):
-                if self._last_blocked[0] and self._last_blocked[1]:
-                    self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
-                _clear_status(context)
+            ok, err = self._update_preview(context, bm, obj, "WHEELUP")
+            if not ok:
+                if self._disable_protection:
+                    self.report({'WARNING'}, err or "No adjacent loop found")
+                else:
+                    if err == "Reached protected silhouette loop":
+                        self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
+                    else:
+                        self.report({'WARNING'}, err or "No adjacent loop found")
                 self.extend = max(0, self.extend - 1)
                 return {'RUNNING_MODAL'}
             if self._last_blocked[0] != self._last_blocked[1]:
@@ -491,18 +500,23 @@ class MESH_OT_loop_sculpt(Operator):
             return {'RUNNING_MODAL'}
 
         if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS'}:
-            if context.area and context.area.type != 'VIEW_3D':
-                return {'RUNNING_MODAL'}
             self.extend = max(0, self.extend - 1)
             obj, bm = _active_bm(context)
             if not bm:
-                _debug_log("wheel down: cancelled (no edit mesh)")
-                return {'CANCELLED'}
+                self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
+                return {'RUNNING_MODAL'}
             bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            if not self._update_preview(context, bm, obj, "WHEELDOWN"):
-                _clear_status(context)
+            ok, err = self._update_preview(context, bm, obj, "WHEELDOWN")
+            if not ok:
+                if self._disable_protection:
+                    self.report({'WARNING'}, err or "No adjacent loop found")
+                else:
+                    if err == "Reached protected silhouette loop":
+                        self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
+                    else:
+                        self.report({'WARNING'}, err or "No adjacent loop found")
                 return {'RUNNING_MODAL'}
             _status(context, self._status_text())
             return {'RUNNING_MODAL'}
