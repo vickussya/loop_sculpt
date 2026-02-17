@@ -17,6 +17,17 @@ def _active_bm(context):
         return None, None
     return obj, bmesh.from_edit_mesh(obj.data)
 
+def _debug_text():
+    text = bpy.data.texts.get("LoopSculpt_Debug")
+    if text is None:
+        text = bpy.data.texts.new("LoopSculpt_Debug")
+    return text
+
+
+def _debug_log(message):
+    text = _debug_text()
+    text.write(message + "\n")
+
 def _edge_by_index(bm, index):
     try:
         return bm.edges[index]
@@ -285,15 +296,22 @@ class MESH_OT_loop_sculpt(Operator):
         obj, bm = _active_bm(context)
         if not bm:
             self.report({'WARNING'}, "Active mesh edit mode required")
+            _debug_log("invoke: cancelled (no edit mesh)")
             return {'CANCELLED'}
 
         bm.edges.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
 
-        bm.edges.ensure_lookup_table()
-        bm.verts.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
+        selected_edges = [e for e in bm.edges if e.select]
+        _debug_log(
+            "invoke: mode=%s obj=%s selected_edges=%d" %
+            (context.mode, obj.name if obj else "None", len(selected_edges))
+        )
+        if len(selected_edges) < 2:
+            self.report({'ERROR'}, "Select an entire edge loop (at least 2 edges)")
+            _debug_log("invoke: cancelled (selection too small)")
+            return {'CANCELLED'}
 
         start_edge = None
         if bm.select_history and isinstance(bm.select_history[-1], bmesh.types.BMEdge):
@@ -305,17 +323,23 @@ class MESH_OT_loop_sculpt(Operator):
                     break
         if not start_edge:
             self.report({'WARNING'}, "Select an edge on a loop")
+            _debug_log("invoke: cancelled (no start edge)")
             return {'CANCELLED'}
 
         base_loop = build_edge_loop(start_edge)
         if not base_loop or len(base_loop) < 2:
             self.report({'WARNING'}, "No valid edge loop found")
+            _debug_log("invoke: cancelled (no valid loop)")
             return {'CANCELLED'}
 
         settings = _settings_from_context(context)
         if not settings:
             self.report({'ERROR'}, "Loop Sculpt settings missing. Reinstall the add-on.")
+            _debug_log("invoke: cancelled (settings missing)")
             return {'CANCELLED'}
+        if settings.vg_name and obj and not obj.vertex_groups.get(settings.vg_name):
+            self.report({'WARNING'}, f"Vertex group '{settings.vg_name}' not found")
+            _debug_log("invoke: warning (vertex group missing)")
 
         self._start_edge_index = start_edge.index
         self._base_loop_indices = _loop_indices(base_loop)
@@ -327,9 +351,9 @@ class MESH_OT_loop_sculpt(Operator):
         self._settings_snapshot = _snapshot_settings(settings)
 
         self.extend = 0
-        self._update_preview(context, bm)
         _status(context, self._status_text())
         context.window_manager.modal_handler_add(self)
+        _debug_log("invoke: running (base_loop_edges=%d)" % len(self._base_loop_indices))
         return {'RUNNING_MODAL'}
 
     def _status_text(self):
@@ -351,9 +375,15 @@ class MESH_OT_loop_sculpt(Operator):
             return None
         if not loops:
             return set()
-        s = self._settings_snapshot
         # Always start from the selected loop and alternate outward:
         # selected, unselected, selected, unselected...
+
+        obj = context.active_object
+        if s.get('vg_name', "") and obj and not obj.vertex_groups.get(s.get('vg_name', "")):
+            self.report({'WARNING'}, f"Vertex group '{s.get('vg_name', '')}' not found; filter disabled")
+            s = dict(s)
+            s['vg_name'] = ""
+            _debug_log("filter: disabled missing vertex group")
 
         edges = set()
         for idx, loop in enumerate(loops):
@@ -379,6 +409,8 @@ class MESH_OT_loop_sculpt(Operator):
         edges = self._edges_to_dissolve(context, bm)
         if edges is None:
             return False
+        if not edges:
+            return True
         _deselect_all(bm)
         for e in edges:
             if e.is_valid:
@@ -391,35 +423,42 @@ class MESH_OT_loop_sculpt(Operator):
             self.extend += 1
             obj, bm = _active_bm(context)
             if not bm:
+                _debug_log("wheel up: cancelled (no edit mesh)")
                 return {'CANCELLED'}
             bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
                 self.report({'WARNING'}, "Edge loop data changed; restart the tool")
+                _debug_log("wheel up: cancelled (edge data changed)")
                 _clear_status(context)
                 return {'CANCELLED'}
             _status(context, self._status_text())
+            _debug_log("wheel up: extend=%d" % self.extend)
             return {'RUNNING_MODAL'}
 
         if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS'}:
             self.extend = max(0, self.extend - 1)
             obj, bm = _active_bm(context)
             if not bm:
+                _debug_log("wheel down: cancelled (no edit mesh)")
                 return {'CANCELLED'}
             bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
                 self.report({'WARNING'}, "Edge loop data changed; restart the tool")
+                _debug_log("wheel down: cancelled (edge data changed)")
                 _clear_status(context)
                 return {'CANCELLED'}
             _status(context, self._status_text())
+            _debug_log("wheel down: extend=%d" % self.extend)
             return {'RUNNING_MODAL'}
 
         if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'}:
             obj, bm = _active_bm(context)
             if not bm:
+                _debug_log("finish: cancelled (no edit mesh)")
                 return {'CANCELLED'}
             bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
@@ -427,6 +466,7 @@ class MESH_OT_loop_sculpt(Operator):
             edges = self._edges_to_dissolve(context, bm)
             if edges is None:
                 self.report({'WARNING'}, "Edge loop data changed; restart the tool")
+                _debug_log("finish: cancelled (edge data changed)")
                 _clear_status(context)
                 return {'CANCELLED'}
             if not edges:
@@ -434,10 +474,12 @@ class MESH_OT_loop_sculpt(Operator):
                 _restore_selection(bm, self._orig_sel)
                 bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
                 _clear_status(context)
+                _debug_log("finish: cancelled (no edges matched)")
                 return {'CANCELLED'}
             bmesh.ops.dissolve_edges(bm, edges=list(edges), use_verts=True)
             bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=True)
             _clear_status(context)
+            _debug_log("finish: applied")
             return {'FINISHED'}
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
@@ -446,6 +488,8 @@ class MESH_OT_loop_sculpt(Operator):
                 _restore_selection(bm, self._orig_sel)
                 bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
             _clear_status(context)
+            self.report({'INFO'}, "Loop Sculpt cancelled; selection restored")
+            _debug_log("cancel: restored selection")
             return {'CANCELLED'}
 
         return {'RUNNING_MODAL'}
@@ -478,6 +522,8 @@ class VIEW3D_PT_loop_sculpt(Panel):
         col = layout.column(align=True)
         col.label(text="Hair Filters")
         obj = context.active_object
+        if settings.vg_name and obj and not obj.vertex_groups.get(settings.vg_name):
+            col.label(text=f"Vertex group '{settings.vg_name}' not found", icon='ERROR')
         if obj:
             col.prop_search(settings, "vg_name", obj, "vertex_groups", text="Vertex Group")
         else:
