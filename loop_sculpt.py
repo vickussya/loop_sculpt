@@ -68,6 +68,47 @@ def _opposite_edge_in_face(face, edge):
     return None
 
 
+def _walk_loop_from_face(edge, face):
+    if len(face.verts) != 4:
+        return []
+    loop_edges = []
+    curr_edge = edge
+    curr_face = face
+    visited = set()
+    while True:
+        opp = _opposite_edge_in_face(curr_face, curr_edge)
+        if not opp or opp in visited:
+            break
+        loop_edges.append(opp)
+        visited.add(opp)
+        next_face = None
+        for f in opp.link_faces:
+            if f is curr_face:
+                continue
+            if len(f.verts) == 4:
+                next_face = f
+                break
+        if not next_face:
+            break
+        curr_edge, curr_face = opp, next_face
+        if curr_edge is edge:
+            break
+    return loop_edges
+
+
+def build_edge_loop(edge):
+    loop = {edge}
+    for f in edge.link_faces:
+        if len(f.verts) != 4:
+            continue
+        loop.update(_walk_loop_from_face(edge, f))
+    return loop
+
+
+def _representative_edge(loop_edges):
+    return min(loop_edges, key=lambda e: e.index)
+
+
 def _is_boundary_edge(edge):
     return len(edge.link_faces) != 2
 
@@ -189,61 +230,17 @@ def _validate_loop_edges(edges):
     return True, ""
 
 
-def _extract_components(edges):
-    components = []
-    remaining = set(edges)
-    while remaining:
-        start = next(iter(remaining))
-        comp = {start}
-        stack = [start]
-        remaining.remove(start)
-        while stack:
-            cur = stack.pop()
-            for v in cur.verts:
-                for le in v.link_edges:
-                    if le in remaining:
-                        remaining.remove(le)
-                        comp.add(le)
-                        stack.append(le)
-        components.append(comp)
-    return components
-
-
-def _neighbor_loop_side(loop_edges, face_set, prev_loop, base_centroid, protect_angle_deg):
-    candidates = set()
-    used_faces = set()
-    for e in loop_edges:
-        face = None
-        for f in e.link_faces:
-            if f in face_set:
-                face = f
-                break
-        if not face or len(face.verts) != 4:
-            continue
-        opp = _opposite_edge_in_face(face, e)
-        if opp:
-            candidates.add(opp)
-            used_faces.add(face)
-    if not candidates or not used_faces:
-        return None, None, []
-    components = _extract_components(candidates)
-    infos = []
-    prev_keys = _loop_keys(prev_loop) if prev_loop else None
-    base_c = base_centroid
-    for comp in components:
-        ok, _reason = _validate_loop_edges(comp)
-        if not ok:
-            continue
-        if prev_keys and _loop_keys(comp) == prev_keys:
-            continue
-        centroid = _loop_centroid(comp)
-        dist = (centroid - base_c).length if centroid and base_c else 0.0
-        prot = _loop_is_protected(comp, protect_angle_deg)
-        infos.append((prot, dist, comp))
-    if not infos:
-        return None, None, []
-    infos.sort(key=lambda x: (x[0], x[1]))
-    return infos[0][2], used_faces, infos
+def _next_loop_on_side(loop_edges, side_normal):
+    e0 = _representative_edge(loop_edges)
+    faces = [f for f in e0.link_faces if len(f.verts) == 4]
+    if not faces:
+        return None, None, None, None
+    face = max(faces, key=lambda f: f.normal.dot(side_normal))
+    opp = _opposite_edge_in_face(face, e0)
+    if not opp:
+        return None, None, None, None
+    loop = build_edge_loop(opp)
+    return loop, face, opp, face.normal.copy()
 
 
 class LoopSculptSettings(PropertyGroup):
@@ -326,86 +323,80 @@ class MESH_OT_loop_sculpt(Operator):
         if not base_loop:
             return None
 
-        base_centroid = _loop_centroid(base_loop)
         hop = self._skip_loops + 1
+        base_centroid = _loop_centroid(base_loop)
 
-        side_faces = []
-        e0 = next(iter(base_loop))
-        for f in e0.link_faces:
-            if len(f.verts) == 4:
-                side_faces.append(f)
-        side_faces = side_faces[:2]
+        e0 = _representative_edge(base_loop)
+        faces = [f for f in e0.link_faces if len(f.verts) == 4]
+        side_normals = [f.normal.copy() for f in faces[:2]]
 
-        side_seed = []
-        for f in side_faces:
-            side_seed.append({f})
-
-        side_selected = [[], []]
+        selected_loops = [base_loop]
         blocked = [False, False]
         applied = [False, False]
 
         for side_index in range(2):
-            if side_index >= len(side_seed):
+            if side_index >= len(side_normals):
                 blocked[side_index] = True
                 continue
+            side_normal = side_normals[side_index]
             curr_loop = base_loop
-            face_set = side_seed[side_index]
-            prev_loop = None
+            curr_normal = side_normal
+            rep_edge = _representative_edge(curr_loop)
+            rep_face = faces[side_index] if side_index < len(faces) else None
+            rep_opp = None
+
             for _step in range(step):
                 for _hop in range(hop):
-                    nxt_loop, next_face_set, infos = _neighbor_loop_side(
-                        curr_loop,
-                        face_set,
-                        prev_loop,
-                        base_centroid,
-                        self._protect_angle_deg,
-                    )
+                    nxt_loop, face, opp, next_normal = _next_loop_on_side(curr_loop, curr_normal)
                     _debug_log(
-                        "event=wheel hop=%d side=%d cand=%d" %
-                        (_hop + 1, side_index, len(infos))
-                    )
-                    for prot, dist, _comp in infos:
-                        _debug_log(
-                            "  cand dist=%.4f protected=%s" %
-                            (dist, prot)
+                        "event=wheel side=%d hop=%d rep_edge=%d face=%s opp=%s" % (
+                            side_index,
+                            _hop + 1,
+                            rep_edge.index if rep_edge else -1,
+                            face.index if face else -1,
+                            opp.index if opp else -1,
                         )
-                    if not nxt_loop or not next_face_set:
+                    )
+                    if not nxt_loop:
                         blocked[side_index] = True
                         break
-                    prev_loop = curr_loop
+                    rep_edge = _representative_edge(nxt_loop)
+                    rep_face = face
+                    rep_opp = opp
                     curr_loop = nxt_loop
-                    face_set = next_face_set
+                    curr_normal = next_normal
                 if blocked[side_index]:
                     break
-                # Only check protection on the loop we intend to SELECT.
-                if _loop_is_protected(curr_loop, self._protect_angle_deg):
+                # Only check protection on the final selectable loop.
+                prot = _loop_is_protected(curr_loop, self._protect_angle_deg)
+                if prot:
                     blocked[side_index] = True
                     break
-                side_selected[side_index].append(curr_loop)
+                selected_loops.append(curr_loop)
                 applied[side_index] = True
 
-        selected_loops = [base_loop]
-        for side in side_selected:
-            selected_loops.extend(side)
+            _debug_log(
+                "side=%d base_center=%s final_size=%d protected=%s" % (
+                    side_index,
+                    base_centroid,
+                    len(curr_loop) if curr_loop else 0,
+                    _loop_is_protected(curr_loop, self._protect_angle_deg) if curr_loop else False,
+                )
+            )
 
         edges = set()
         for loop in selected_loops:
             edges.update(loop)
 
         _debug_log(
-            "step=%d skip=%d hop=%d protect=%d base=%d base_prot=%s sideA=%d sideA_prot=%s sideB=%d sideB_prot=%s selA=%d selB=%d" % (
+            "step=%d skip=%d hop=%d protect=%d base=%d selA=%s selB=%s" % (
                 step,
                 self._skip_loops,
                 hop,
                 self._protect_angle_deg,
                 len(base_loop),
-                _loop_is_protected(base_loop, self._protect_angle_deg),
-                len(side_selected[0][-1]) if side_selected[0] else 0,
-                _loop_is_protected(side_selected[0][-1], self._protect_angle_deg) if side_selected[0] else False,
-                len(side_selected[1][-1]) if side_selected[1] else 0,
-                _loop_is_protected(side_selected[1][-1], self._protect_angle_deg) if side_selected[1] else False,
-                len(side_selected[0]),
-                len(side_selected[1]),
+                applied[0],
+                applied[1],
             )
         )
 
@@ -445,15 +436,14 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
-                self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
-                _debug_log("wheel up: blocked (protected)")
+                if self._last_blocked[0] and self._last_blocked[1]:
+                    self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
+                _debug_log("wheel up: blocked")
                 _clear_status(context)
                 self.extend = max(0, self.extend - 1)
                 return {'RUNNING_MODAL'}
-            if self._last_blocked[0] and self._last_blocked[1]:
-                self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
-            elif self._last_blocked[0] != self._last_blocked[1]:
-                self.report({'INFO'}, "Side A/B blocked by silhouette; other side extended.")
+            if self._last_blocked[0] != self._last_blocked[1]:
+                self.report({'INFO'}, "Side A blocked, side B extended.")
             _status(context, self._status_text())
             _debug_log("wheel up: extend=%d" % self.extend)
             return {'RUNNING_MODAL'}
@@ -470,8 +460,7 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
-                self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
-                _debug_log("wheel down: blocked (protected)")
+                _debug_log("wheel down: blocked")
                 _clear_status(context)
                 return {'RUNNING_MODAL'}
             _status(context, self._status_text())
