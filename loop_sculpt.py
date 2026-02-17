@@ -32,25 +32,23 @@ def _edge_key(edge):
     return (a, b) if a < b else (b, a)
 
 
-def _edge_from_key(bm, key):
-    a, b = key
-    if a >= len(bm.verts) or b >= len(bm.verts):
-        return None
-    v1 = bm.verts[a]
-    v2 = bm.verts[b]
-    for e in v1.link_edges:
-        if v2 in e.verts:
-            return e
-    return None
+def _edge_by_key(bm):
+    edge_map = {}
+    for e in bm.edges:
+        v1, v2 = e.verts
+        a = v1.index
+        b = v2.index
+        key = (a, b) if a < b else (b, a)
+        edge_map[key] = e
+    return edge_map
 
 
-def _edges_from_keys(bm, keys):
-    edges = set()
+def _edges_from_keys(edge_map, keys):
+    edges = []
     for key in keys:
-        e = _edge_from_key(bm, key)
-        if not e:
-            return None
-        edges.add(e)
+        e = edge_map.get(key)
+        if e:
+            edges.append(e)
     return edges
 
 
@@ -58,10 +56,13 @@ def _loop_keys(edges):
     return {_edge_key(e) for e in edges}
 
 
-def _loop_centroid(loop_edges):
+def _loop_centroid_from_keys(edge_map, loop_keys):
     total = None
     count = 0
-    for e in loop_edges:
+    for key in loop_keys:
+        e = edge_map.get(key)
+        if not e:
+            continue
         v1, v2 = e.verts
         mid = (v1.co + v2.co) * 0.5
         if total is None:
@@ -72,22 +73,6 @@ def _loop_centroid(loop_edges):
     if total is None or count == 0:
         return None
     return total / count
-
-
-def _representative_edge(edges):
-    if not edges:
-        return None
-    preferred = None
-    for e in edges:
-        if len(e.link_faces) != 2:
-            continue
-        for f in e.link_faces:
-            if len(f.verts) == 4:
-                preferred = e
-                break
-        if preferred:
-            break
-    return preferred if preferred else next(iter(edges))
 
 
 def _deselect_all(bm):
@@ -191,8 +176,27 @@ def _is_protected_edge(edge, protect_angle_deg):
     return False
 
 
-def _loop_is_protected(loop_edges, protect_angle_deg):
-    return any(_is_protected_edge(e, protect_angle_deg) for e in loop_edges)
+def _loop_is_protected(loop_keys, edge_map, protect_angle_deg):
+    for key in loop_keys:
+        e = edge_map.get(key)
+        if e and _is_protected_edge(e, protect_angle_deg):
+            return True
+    return False
+
+
+def _sample_protected(loop_keys, edge_map, protect_angle_deg, max_items=5):
+    edges = []
+    angles = []
+    for key in loop_keys:
+        e = edge_map.get(key)
+        if not e:
+            continue
+        if _is_protected_edge(e, protect_angle_deg):
+            edges.append(e.index)
+            angles.append(_edge_dihedral_deg(e))
+            if len(edges) >= max_items:
+                break
+    return edges, angles
 
 
 def _get_loop_from_seed_edge(bm, obj, area, region, window, seed_edge):
@@ -314,13 +318,7 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("invoke: cancelled (selection invalid: %s)" % reason)
             return {'CANCELLED'}
 
-        base_rep = _representative_edge(selected_edges)
-        if not base_rep:
-            self.report({'ERROR'}, "No valid edge found in selection")
-            _debug_log("invoke: cancelled (no representative edge)")
-            return {'CANCELLED'}
-
-        self._base_loop_keys = _loop_keys(selected_edges)
+        self._base_loop_keys = list(_loop_keys(selected_edges))
         self._orig_sel = {
             'edges': {e for e in bm.edges if e.select},
             'verts': {v for v in bm.verts if v.select},
@@ -331,6 +329,11 @@ class MESH_OT_loop_sculpt(Operator):
         self._skip_loops = settings.skip_loops if settings else 1
         self._protect_angle_deg = settings.protect_angle_deg if settings else 45
         self._disable_protection = settings.disable_protection if settings else False
+
+        base_rep = min(selected_edges, key=lambda e: e.index) if selected_edges else None
+        if not base_rep:
+            self.report({'ERROR'}, "No representative edge found")
+            return {'CANCELLED'}
 
         ring_edges = _get_ring_edges_from_seed(bm, obj, self._area, self._region, self._win, base_rep)
         if not ring_edges:
@@ -345,7 +348,7 @@ class MESH_OT_loop_sculpt(Operator):
             loop = _get_loop_from_seed_edge(bm, obj, self._area, self._region, self._win, seed)
             if not loop:
                 break
-            loops.append(loop)
+            loops.append(list(_loop_keys(loop)))
             unassigned -= loop
 
         if not loops:
@@ -353,8 +356,9 @@ class MESH_OT_loop_sculpt(Operator):
             return {'CANCELLED'}
 
         # Order loops by projection along strip direction.
-        centroids = [_loop_centroid(loop) for loop in loops]
-        base_centroid = _loop_centroid(selected_edges)
+        edge_map = _edge_by_key(bm)
+        centroids = [_loop_centroid_from_keys(edge_map, loop) for loop in loops]
+        base_centroid = _loop_centroid_from_keys(edge_map, self._base_loop_keys)
         if base_centroid is None:
             self.report({'ERROR'}, "Base loop centroid not found")
             return {'CANCELLED'}
@@ -384,10 +388,10 @@ class MESH_OT_loop_sculpt(Operator):
         self._ordered_loops = [loop for _, loop in projections]
 
         # Determine base index.
-        base_keys = _loop_keys(selected_edges)
+        base_keys = set(self._base_loop_keys)
         base_index = -1
         for i, loop in enumerate(self._ordered_loops):
-            if _loop_keys(loop) == base_keys:
+            if set(loop) == base_keys:
                 base_index = i
                 break
         if base_index < 0:
@@ -410,6 +414,8 @@ class MESH_OT_loop_sculpt(Operator):
         distance = self._distance
         base_index = self._base_index
         loops = self._ordered_loops
+
+        edge_map = _edge_by_key(bm)
 
         selected = []
         base_loop = loops[base_index]
@@ -436,8 +442,8 @@ class MESH_OT_loop_sculpt(Operator):
             sample_edges = []
             sample_angles = []
             if not self._disable_protection:
-                protected = _loop_is_protected(loop, self._protect_angle_deg)
-                sample_edges, sample_angles = _sample_protected(loop, self._protect_angle_deg)
+                protected = _loop_is_protected(loop, edge_map, self._protect_angle_deg)
+                sample_edges, sample_angles = _sample_protected(loop, edge_map, self._protect_angle_deg)
             _debug_log("%s_attempt:" % label)
             _debug_log("    final_loop_edges=%d, protected=%s" % (len(loop), protected))
             _debug_log("    sample_protected_edges=%s" % sample_edges)
@@ -466,7 +472,10 @@ class MESH_OT_loop_sculpt(Operator):
 
         edges = set()
         for loop in selected:
-            edges.update(loop)
+            for key in loop:
+                e = edge_map.get(key)
+                if e:
+                    edges.add(e)
 
         _deselect_all(bm)
         for e in edges:
@@ -480,13 +489,13 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("EVENT: %s %s" % (event.type, event.value))
 
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
-            self._distance = min(self._distance + (self._skip_loops + 1), len(self._ordered_loops))
+            self._distance = min(self._distance + (self._skip_loops + 1), len(self._ordered_loops) - 1)
             obj, bm = _active_bm(context)
             if not bm:
                 self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
                 return {'RUNNING_MODAL'}
-            bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             self._select_loops_at_distance(bm, obj, "WHEELUP")
             _status(context, self._status_text())
@@ -498,8 +507,8 @@ class MESH_OT_loop_sculpt(Operator):
             if not bm:
                 self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
                 return {'RUNNING_MODAL'}
-            bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             self._select_loops_at_distance(bm, obj, "WHEELDOWN")
             _status(context, self._status_text())
@@ -514,11 +523,14 @@ class MESH_OT_loop_sculpt(Operator):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
             obj, bm = _active_bm(context)
             if bm:
-                base_loop = _edges_from_keys(bm, self._base_loop_keys)
+                edge_map = _edge_by_key(bm)
+                base_loop = self._base_loop_keys
                 if base_loop:
                     _deselect_all(bm)
-                    for e in base_loop:
-                        e.select = True
+                    for key in base_loop:
+                        e = edge_map.get(key)
+                        if e:
+                            e.select = True
                     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
                 else:
                     _restore_selection(bm, self._orig_sel)
