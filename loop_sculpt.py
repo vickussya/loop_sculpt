@@ -75,6 +75,36 @@ def _loop_centroid_from_keys(edge_map, loop_keys):
     return total / count
 
 
+def _principal_axis(centroids):
+    if not centroids:
+        return mathutils.Vector((1.0, 0.0, 0.0))
+    mean = mathutils.Vector((0.0, 0.0, 0.0))
+    for c in centroids:
+        mean += c
+    mean /= len(centroids)
+    cov = mathutils.Matrix(((0.0, 0.0, 0.0),
+                            (0.0, 0.0, 0.0),
+                            (0.0, 0.0, 0.0)))
+    for c in centroids:
+        d = c - mean
+        cov[0][0] += d.x * d.x
+        cov[0][1] += d.x * d.y
+        cov[0][2] += d.x * d.z
+        cov[1][0] += d.y * d.x
+        cov[1][1] += d.y * d.y
+        cov[1][2] += d.y * d.z
+        cov[2][0] += d.z * d.x
+        cov[2][1] += d.z * d.y
+        cov[2][2] += d.z * d.z
+    axis = mathutils.Vector((1.0, 0.0, 0.0))
+    for _ in range(8):
+        axis = cov @ axis
+        if axis.length == 0.0:
+            return mathutils.Vector((1.0, 0.0, 0.0))
+        axis.normalize()
+    return axis
+
+
 def _deselect_all(bm):
     for e in bm.edges:
         e.select = False
@@ -363,26 +393,13 @@ class MESH_OT_loop_sculpt(Operator):
             self.report({'ERROR'}, "Base loop centroid not found")
             return {'CANCELLED'}
 
-        farthest = None
-        max_dist = -1.0
-        for c in centroids:
-            if c is None:
-                continue
-            dist = (c - base_centroid).length
-            if dist > max_dist:
-                max_dist = dist
-                farthest = c
-        if farthest is None or max_dist == 0.0:
-            direction = mathutils.Vector((1.0, 0.0, 0.0))
-        else:
-            direction = (farthest - base_centroid).normalized()
-
         projections = []
+        axis = _principal_axis([c for c in centroids if c is not None])
         for loop, c in zip(loops, centroids):
             if c is None:
                 proj = 0.0
             else:
-                proj = (c - base_centroid).dot(direction)
+                proj = (c - base_centroid).dot(axis)
             projections.append((proj, loop))
         projections.sort(key=lambda x: x[0])
         self._ordered_loops = [loop for _, loop in projections]
@@ -398,7 +415,11 @@ class MESH_OT_loop_sculpt(Operator):
             self.report({'ERROR'}, "Base loop not found in ring order")
             return {'CANCELLED'}
         self._base_index = base_index
-        self._distance = 0
+        self._step_count = 0
+        hop = self._skip_loops + 1
+        max_left = base_index
+        max_right = (len(self._ordered_loops) - 1) - base_index
+        self._max_steps = max(max_left, max_right) // hop
 
         self.extend = 0
         _status(context, self._status_text())
@@ -409,66 +430,69 @@ class MESH_OT_loop_sculpt(Operator):
     def _status_text(self):
         return f"Loop Sculpt | Extend: {self.extend} | Skip: {self._skip_loops}"
 
-    def _select_loops_at_distance(self, bm, obj, event_name):
+    def _select_loops_by_step(self, bm, obj, event_name):
         hop = self._skip_loops + 1
-        distance = self._distance
+        step_count = self._step_count
         base_index = self._base_index
         loops = self._ordered_loops
 
         edge_map = _edge_by_key(bm)
 
-        selected = []
-        base_loop = loops[base_index]
-        selected.append(base_loop)
+        selected = [loops[base_index]]
 
         _debug_log("event: %s" % event_name)
+        _debug_log("base_i=%d total_loops=%d" % (base_index, len(loops)))
         _debug_log("skip_loops=%d, hop=%d, protect_angle=%d, protection_disabled=%s" % (
             self._skip_loops,
             hop,
             self._protect_angle_deg,
             self._disable_protection,
         ))
-        _debug_log("base_loop: edges=%d" % len(base_loop))
+        _debug_log("base_loop: edges=%d" % len(loops[base_index]))
 
-        idx_a = base_index - distance
-        idx_b = base_index + distance
+        chosen_indices = [base_index]
+        blocked_indices = []
 
-        def maybe_add(idx, label):
+        def maybe_add(idx):
             if idx < 0 or idx >= len(loops):
-                _debug_log("%s final_loop_edges=0" % label)
                 return False
             loop = loops[idx]
-            protected = False
-            sample_edges = []
-            sample_angles = []
-            if not self._disable_protection:
-                protected = _loop_is_protected(loop, edge_map, self._protect_angle_deg)
-                sample_edges, sample_angles = _sample_protected(loop, edge_map, self._protect_angle_deg)
-            _debug_log("%s_attempt:" % label)
-            _debug_log("    final_loop_edges=%d, protected=%s" % (len(loop), protected))
-            _debug_log("    sample_protected_edges=%s" % sample_edges)
-            _debug_log("    sample_angles_deg=%s" % [round(a, 2) for a in sample_angles])
-            if self._disable_protection or not protected:
+            if self._disable_protection:
                 selected.append(loop)
                 return True
-            return False
+            protected = _loop_is_protected(loop, edge_map, self._protect_angle_deg)
+            if protected:
+                blocked_indices.append(idx)
+                return False
+            selected.append(loop)
+            return True
 
         added_a = False
         added_b = False
-        if distance == 0:
-            added_a = True
-            added_b = True
-        else:
-            added_a = maybe_add(idx_a, "sideA")
-            if idx_b != idx_a:
-                added_b = maybe_add(idx_b, "sideB")
-            else:
-                added_b = added_a
+        added_current_a = False
+        added_current_b = False
+        for k in range(1, step_count + 1):
+            idx_pos = base_index + k * hop
+            idx_neg = base_index - k * hop
+            chosen_indices.extend([idx_pos, idx_neg])
+            added_pos = maybe_add(idx_pos)
+            added_neg = maybe_add(idx_neg)
+            if added_pos:
+                added_b = True
+            if added_neg:
+                added_a = True
+            if k == step_count:
+                added_current_b = added_pos
+                added_current_a = added_neg
 
-        _debug_log("result:")
-        _debug_log("    added_sideA=%s, added_sideB=%s" % (added_a, added_b))
-        _debug_log("    selected_loops_sideA_count=%d" % (1 if added_a else 0))
-        _debug_log("    selected_loops_sideB_count=%d" % (1 if added_b else 0))
+        _debug_log("hop=%d step_count=%d" % (hop, step_count))
+        _debug_log("chosen_indices=%s" % chosen_indices)
+        for idx in blocked_indices:
+            _debug_log("blocked idx=%d" % idx)
+
+        if event_name in {"WHEELUP", "WHEELDOWN"} and not self._disable_protection:
+            if step_count > 0 and not added_current_a and not added_current_b:
+                self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
 
         edges = set()
         for loop in selected:
@@ -489,7 +513,7 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("EVENT: %s %s" % (event.type, event.value))
 
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
-            self._distance = min(self._distance + (self._skip_loops + 1), len(self._ordered_loops) - 1)
+            self._step_count = min(self._step_count + 1, self._max_steps)
             obj, bm = _active_bm(context)
             if not bm:
                 self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
@@ -497,12 +521,12 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.edges.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            self._select_loops_at_distance(bm, obj, "WHEELUP")
+            self._select_loops_by_step(bm, obj, "WHEELUP")
             _status(context, self._status_text())
             return {'RUNNING_MODAL'}
 
         if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS'}:
-            self._distance = max(0, self._distance - (self._skip_loops + 1))
+            self._step_count = max(0, self._step_count - 1)
             obj, bm = _active_bm(context)
             if not bm:
                 self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
@@ -510,7 +534,7 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.edges.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            self._select_loops_at_distance(bm, obj, "WHEELDOWN")
+            self._select_loops_by_step(bm, obj, "WHEELDOWN")
             _status(context, self._status_text())
             return {'RUNNING_MODAL'}
 
