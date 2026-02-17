@@ -384,7 +384,6 @@ class MESH_OT_loop_sculpt(Operator):
         # Build loops from ring edges, dedupe, and keep only loops matching base size.
         unassigned = set(ring_edges)
         loops = []
-        loop_sets = []
         seen_sets = set()
         while unassigned:
             seed = next(iter(unassigned))
@@ -407,7 +406,6 @@ class MESH_OT_loop_sculpt(Operator):
                 continue
             seen_sets.add(key)
             loops.append(list(loop_set))
-            loop_sets.append(loop_set)
             unassigned -= loop
 
         if not loops:
@@ -469,7 +467,7 @@ class MESH_OT_loop_sculpt(Operator):
 
         edge_map = _edge_by_key(bm)
 
-        selected = [loops[base_index]]
+        selected = []
 
         _debug_log("event: %s" % event_name)
         _debug_log("base_i=%d total_loops=%d" % (base_index, len(loops)))
@@ -481,8 +479,9 @@ class MESH_OT_loop_sculpt(Operator):
         ))
         _debug_log("base_loop: edges=%d" % len(loops[base_index]))
 
-        chosen_indices = [base_index]
+        intended_indices = [base_index]
         blocked = []
+        selected_indices = []
 
         def idx_status(idx):
             if idx < 0 or idx >= len(loops):
@@ -495,46 +494,34 @@ class MESH_OT_loop_sculpt(Operator):
                     return "protected"
             return "selected"
 
-        def maybe_add(idx):
+        for k in range(1, step_count + 1):
+            intended_indices.extend([base_index + k * hop, base_index - k * hop])
+
+        for idx in intended_indices:
             status = idx_status(idx)
             if status == "selected":
-                selected.append(loops[idx])
-                return True, status
-            blocked.append((idx, status))
-            return False, status
+                selected_indices.append(idx)
+            else:
+                blocked.append((idx, status))
 
-        added_a = False
-        added_b = False
-        added_current_a = False
-        added_current_b = False
-        blocked_current = False
-        for k in range(1, step_count + 1):
-            idx_pos = base_index + k * hop
-            idx_neg = base_index - k * hop
-            chosen_indices.extend([idx_pos, idx_neg])
-            added_pos, _ = maybe_add(idx_pos)
-            added_neg, _ = maybe_add(idx_neg)
-            if added_pos:
-                added_b = True
-            if added_neg:
-                added_a = True
-            if k == step_count:
-                added_current_b = added_pos
-                added_current_a = added_neg
-                blocked_current = not added_pos and not added_neg
+        intended_indices = sorted(dict.fromkeys(intended_indices))
+        selected_indices = sorted(dict.fromkeys(selected_indices))
+        if hop >= 2 and len(selected_indices) > 1:
+            guarded = []
+            for idx in selected_indices:
+                if guarded and abs(idx - guarded[-1]) == 1:
+                    blocked.append((idx, "adjacency_guard"))
+                    continue
+                guarded.append(idx)
+            selected_indices = guarded
 
         _debug_log("hop=%d step_count=%d" % (hop, step_count))
-        _debug_log("chosen_indices=%s" % sorted(set(chosen_indices)))
         _debug_log("base_i=%d total_loops=%d" % (base_index, len(loops)))
-        selected_indices = [base_index]
-        for k in range(1, step_count + 1):
-            selected_indices.extend([base_index + k * hop, base_index - k * hop])
-        selected_indices = sorted(dict.fromkeys(selected_indices))
+        _debug_log("intended_indices=%s" % intended_indices)
         _debug_log("selected_indices=%s" % selected_indices)
         for idx in selected_indices:
-            status = idx_status(idx)
             proj = self._ordered_projections[idx] if 0 <= idx < len(loops) and hasattr(self, "_ordered_projections") else 0.0
-            _debug_log("idx=%d proj=%.6f status=%s" % (idx, proj, status))
+            _debug_log("idx=%d proj=%.6f status=selected" % (idx, proj))
         for idx, reason in blocked:
             _debug_log("blocked idx=%s reason=%s" % (idx, reason))
 
@@ -542,17 +529,13 @@ class MESH_OT_loop_sculpt(Operator):
             if step_count > 0 and blocked_current:
                 self._notified_limit = True
 
-        edges = set()
-        for loop in selected:
-            for key in loop:
-                e = edge_map.get(key)
-                if e:
-                    edges.add(e)
-
         _deselect_all(bm)
-        for e in edges:
-            if e.is_valid:
-                e.select = True
+        for idx in selected_indices:
+            if 0 <= idx < len(loops):
+                for key in loops[idx]:
+                    e = edge_map.get(key)
+                    if e:
+                        e.select = True
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         return True
 
