@@ -180,47 +180,57 @@ def _clear_status(context):
         context.workspace.status_text_set(None)
 
 
+def _is_deferred(value):
+    return value is None or type(value).__name__ == "_PropertyDeferred"
+
+
 def _settings_from_context(context):
     settings = getattr(context.scene, "loop_sculpt_settings", None)
-    if settings is None or type(settings).__name__ == "_PropertyDeferred":
+    if _is_deferred(settings):
         return None
     return settings
 
 
+def _prop_value(value, default):
+    if _is_deferred(value):
+        return default
+    return value
+
+
 def _snapshot_settings(settings):
     return {
-        'step': int(settings.step),
-        'include_start': bool(settings.include_start),
-        'limit_region': bool(settings.limit_region),
-        'vg_name': str(settings.vg_name),
-        'vg_threshold': float(settings.vg_threshold),
-        'material_filter': str(settings.material_filter),
+        'step': int(_prop_value(settings.step, 2)),
+        'include_start': bool(_prop_value(settings.include_start, False)),
+        'limit_region': bool(_prop_value(settings.limit_region, True)),
+        'vg_name': str(_prop_value(settings.vg_name, "")),
+        'vg_threshold': float(_prop_value(settings.vg_threshold, 0.1)),
+        'material_filter': str(_prop_value(settings.material_filter, "NONE")),
     }
 
 
 class LoopSculptSettings(PropertyGroup):
-    step = IntProperty(
+    step: IntProperty(
         name="Step",
         description="Dissolve every Nth loop",
         default=2,
         min=1,
         max=100,
     )
-    include_start = BoolProperty(
+    include_start: BoolProperty(
         name="Include Starting Loop",
         description="Allow dissolving the starting loop",
         default=False,
     )
-    limit_region = BoolProperty(
+    limit_region: BoolProperty(
         name="Limit to Connected Region",
         default=True,
     )
-    vg_name = StringProperty(
+    vg_name: StringProperty(
         name="Vertex Group",
         description="Only dissolve edges where both vertices are in this group",
         default="HAIR",
     )
-    vg_threshold = FloatProperty(
+    vg_threshold: FloatProperty(
         name="Weight Threshold",
         default=0.1,
         min=0.0,
@@ -237,7 +247,7 @@ class LoopSculptSettings(PropertyGroup):
                 items.append((str(idx), name, ""))
         return items
 
-    material_filter = EnumProperty(
+    material_filter: EnumProperty(
         name="Material",
         description="Only dissolve edges connected to faces with this material",
         items=_material_items,
@@ -249,7 +259,7 @@ class MESH_OT_loop_sculpt(Operator):
     bl_label = "Loop Sculpt"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
-    extend = IntProperty(default=0, min=0)
+    extend: IntProperty(default=0, min=0)
 
     def invoke(self, context, event):
         obj, bm = _active_bm(context)
@@ -411,7 +421,7 @@ class VIEW3D_PT_loop_sculpt(Panel):
             layout.label(text="Settings missing; reinstall the add-on.")
             return
 
-        layout.operator(MESH_OT_loop_sculpt.bl_idname, text="Loop Sculpt (Ctrl+X)")
+        layout.operator(MESH_OT_loop_sculpt.bl_idname, text="Loop Sculpt")
         layout.prop(settings, "step")
         layout.prop(settings, "include_start")
         layout.prop(settings, "limit_region")
@@ -427,33 +437,14 @@ class VIEW3D_PT_loop_sculpt(Panel):
         col.prop(settings, "material_filter")
 
 
-addon_keymaps = []
-
-
-def register_keymap():
-    wm = bpy.context.window_manager
-    if wm.keyconfigs.addon:
-        km = wm.keyconfigs.addon.keymaps.new(name='Mesh', space_type='EMPTY')
-        kmi = km.keymap_items.new(MESH_OT_loop_sculpt.bl_idname, type='X', value='PRESS', ctrl=True)
-        addon_keymaps.append((km, kmi))
-
-
-def unregister_keymap():
-    for km, kmi in addon_keymaps:
-        km.keymap_items.remove(kmi)
-    addon_keymaps.clear()
-
-
 def register():
     bpy.utils.register_class(LoopSculptSettings)
     bpy.utils.register_class(MESH_OT_loop_sculpt)
     bpy.utils.register_class(VIEW3D_PT_loop_sculpt)
     bpy.types.Scene.loop_sculpt_settings = PointerProperty(type=LoopSculptSettings)
-    register_keymap()
 
 
 def unregister():
-    unregister_keymap()
     if hasattr(bpy.types.Scene, "loop_sculpt_settings"):
         del bpy.types.Scene.loop_sculpt_settings
     bpy.utils.unregister_class(VIEW3D_PT_loop_sculpt)
