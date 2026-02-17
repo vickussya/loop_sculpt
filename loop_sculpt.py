@@ -349,6 +349,7 @@ class MESH_OT_loop_sculpt(Operator):
             return {'CANCELLED'}
 
         self._base_loop_keys = list(_loop_keys(selected_edges))
+        base_loop_set = set(self._base_loop_keys)
         self._orig_sel = {
             'edges': {e for e in bm.edges if e.select},
             'verts': {v for v in bm.verts if v.select},
@@ -370,15 +371,29 @@ class MESH_OT_loop_sculpt(Operator):
             self.report({'ERROR'}, "Edge ring not found for base loop")
             return {'CANCELLED'}
 
-        # Build loops from ring edges.
+        # Build loops from ring edges, dedupe, and keep only loops matching base size.
         unassigned = set(ring_edges)
         loops = []
+        loop_sets = []
+        seen_sets = set()
         while unassigned:
             seed = next(iter(unassigned))
             loop = _get_loop_from_seed_edge(bm, obj, self._area, self._region, self._win, seed)
             if not loop:
                 break
-            loops.append(list(_loop_keys(loop)))
+            loop_set = set(_loop_keys(loop))
+            if len(loop_set) != len(base_loop_set):
+                _debug_log("dedupe: discard loop (size mismatch)")
+                unassigned -= loop
+                continue
+            key = frozenset(loop_set)
+            if key in seen_sets:
+                _debug_log("dedupe: discard loop (duplicate)")
+                unassigned -= loop
+                continue
+            seen_sets.add(key)
+            loops.append(list(loop_set))
+            loop_sets.append(loop_set)
             unassigned -= loop
 
         if not loops:
@@ -399,7 +414,7 @@ class MESH_OT_loop_sculpt(Operator):
             if c is None:
                 proj = 0.0
             else:
-                proj = (c - base_centroid).dot(axis)
+                proj = c.dot(axis)
             projections.append((proj, loop))
         projections.sort(key=lambda x: x[0])
         self._ordered_loops = [loop for _, loop in projections]
@@ -452,10 +467,14 @@ class MESH_OT_loop_sculpt(Operator):
         _debug_log("base_loop: edges=%d" % len(loops[base_index]))
 
         chosen_indices = [base_index]
-        blocked_indices = []
+        blocked = []
 
-        def maybe_add(idx):
+        def maybe_add(idx, side_label):
             if idx < 0 or idx >= len(loops):
+                blocked.append((idx, "out_of_range"))
+                return False
+            if hop > 1 and abs(idx - base_index) % hop != 0:
+                blocked.append((idx, "adjacency_guard"))
                 return False
             loop = loops[idx]
             if self._disable_protection:
@@ -463,7 +482,7 @@ class MESH_OT_loop_sculpt(Operator):
                 return True
             protected = _loop_is_protected(loop, edge_map, self._protect_angle_deg)
             if protected:
-                blocked_indices.append(idx)
+                blocked.append((idx, "protected"))
                 return False
             selected.append(loop)
             return True
@@ -477,8 +496,8 @@ class MESH_OT_loop_sculpt(Operator):
             idx_pos = base_index + k * hop
             idx_neg = base_index - k * hop
             chosen_indices.extend([idx_pos, idx_neg])
-            added_pos = maybe_add(idx_pos)
-            added_neg = maybe_add(idx_neg)
+            added_pos = maybe_add(idx_pos, "right")
+            added_neg = maybe_add(idx_neg, "left")
             if added_pos:
                 added_b = True
             if added_neg:
@@ -489,15 +508,13 @@ class MESH_OT_loop_sculpt(Operator):
                 blocked_current = not added_pos and not added_neg
 
         _debug_log("hop=%d step_count=%d" % (hop, step_count))
-        _debug_log("chosen_indices=%s" % chosen_indices)
-        for idx in blocked_indices:
-            _debug_log("blocked idx=%d" % idx)
+        _debug_log("chosen_indices=%s" % sorted(set(chosen_indices)))
+        for idx, reason in blocked:
+            _debug_log("blocked idx=%s reason=%s" % (idx, reason))
 
         if event_name in {"WHEELUP", "WHEELDOWN"} and not self._disable_protection:
             if step_count > 0 and blocked_current:
-                if not self._notified_limit:
-                    self.report({'INFO'}, "Reached silhouette; further expansion blocked on one or both sides.")
-                    self._notified_limit = True
+                self._notified_limit = True
 
         edges = set()
         for loop in selected:
