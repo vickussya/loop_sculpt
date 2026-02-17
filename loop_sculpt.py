@@ -68,43 +68,6 @@ def _opposite_edge_in_face(face, edge):
     return None
 
 
-def _walk_loop_from_face(edge, face):
-    if len(face.verts) != 4:
-        return []
-    loop_edges = []
-    curr_edge = edge
-    curr_face = face
-    visited = set()
-    while True:
-        opp = _opposite_edge_in_face(curr_face, curr_edge)
-        if not opp or opp in visited:
-            break
-        loop_edges.append(opp)
-        visited.add(opp)
-        next_face = None
-        for f in opp.link_faces:
-            if f is curr_face:
-                continue
-            if len(f.verts) == 4:
-                next_face = f
-                break
-        if not next_face:
-            break
-        curr_edge, curr_face = opp, next_face
-        if curr_edge is edge:
-            break
-    return loop_edges
-
-
-def build_edge_loop(edge):
-    loop = {edge}
-    for f in edge.link_faces:
-        if len(f.verts) != 4:
-            continue
-        loop.update(_walk_loop_from_face(edge, f))
-    return loop
-
-
 def _representative_edge(loop_edges):
     return min(loop_edges, key=lambda e: e.index)
 
@@ -141,6 +104,15 @@ def _is_protected_edge(edge, protect_angle_deg):
 
 def _loop_is_protected(loop_edges, protect_angle_deg):
     return any(_is_protected_edge(e, protect_angle_deg) for e in loop_edges)
+
+
+def _sample_edges(loop_edges, max_items=3):
+    result = []
+    for e in loop_edges:
+        result.append(e.index)
+        if len(result) >= max_items:
+            break
+    return result
 
 
 def _sample_protected(loop_edges, protect_angle_deg, max_items=5):
@@ -226,21 +198,62 @@ def _validate_loop_edges(edges):
     return True, ""
 
 
-def _neighbor_on_side(loop_edges, seed_face):
-    # Find a representative edge that has the seed face.
+def _get_loop_from_seed_edge(bm, obj, area, region, seed_edge):
+    original = {e for e in bm.edges if e.select}
+    _deselect_all(bm)
+    seed_edge.select = True
+    bm.select_history.clear()
+    bm.select_history.add(seed_edge)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    with bpy.context.temp_override(
+        area=area,
+        region=region,
+        active_object=obj,
+        object=obj,
+    ):
+        bpy.ops.mesh.loop_multi_select(ring=False)
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+    loop = {e for e in bm.edges if e.select}
+
+    _deselect_all(bm)
+    for e in original:
+        if e.is_valid:
+            e.select = True
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    return loop
+
+
+def _neighbor_on_side(bm, obj, area, region, loop_edges, seed_face, prev_loop):
     e0 = None
     for e in loop_edges:
         if seed_face in e.link_faces:
             e0 = e
             break
     if not e0:
-        return None, None
+        return None, None, None
     if len(seed_face.verts) != 4:
-        return None, None
+        return None, None, None
     opp = _opposite_edge_in_face(seed_face, e0)
     if not opp:
-        return None, None
-    return build_edge_loop(opp), opp
+        return None, None, None
+
+    loop = _get_loop_from_seed_edge(bm, obj, area, region, opp)
+    if not loop:
+        return None, None, None
+
+    if prev_loop and _loop_keys(loop) == _loop_keys(prev_loop):
+        return None, None, None
+
+    next_face = None
+    for f in opp.link_faces:
+        if f is not seed_face and len(f.verts) == 4:
+            next_face = f
+            break
+
+    return loop, opp, next_face
 
 
 class LoopSculptSettings(PropertyGroup):
@@ -324,14 +337,13 @@ class MESH_OT_loop_sculpt(Operator):
     def _status_text(self):
         return f"Loop Sculpt | Extend: {self.extend} | Skip: {self._skip_loops}"
 
-    def _edges_for_step(self, bm, step, event_name):
+    def _edges_for_step(self, bm, obj, step, event_name):
         base_loop = _edges_from_keys(bm, self._base_loop_keys)
         if not base_loop:
             return None
 
         hop = self._skip_loops + 1
 
-        # Two explicit sides based on the two quad faces of a representative edge.
         e0 = _representative_edge(base_loop)
         side_faces = [f for f in e0.link_faces if len(f.verts) == 4]
         side_faces = side_faces[:2]
@@ -356,24 +368,25 @@ class MESH_OT_loop_sculpt(Operator):
 
             curr_loop = base_loop
             curr_face = side_faces[side_index]
+            prev_loop = None
             final_loop = None
             final_opp = None
 
             for _step in range(step):
                 for _hop in range(hop):
-                    nxt_loop, opp = _neighbor_on_side(curr_loop, curr_face)
-                    if not nxt_loop:
+                    nxt_loop, opp, next_face = _neighbor_on_side(
+                        bm,
+                        obj,
+                        self._area,
+                        self._region,
+                        curr_loop,
+                        curr_face,
+                        prev_loop,
+                    )
+                    if not nxt_loop or not next_face:
                         blocked[side_index] = True
                         break
-                    # Advance: the next face for the side is the quad on the other side of opp.
-                    next_face = None
-                    for f in opp.link_faces:
-                        if f is not curr_face and len(f.verts) == 4:
-                            next_face = f
-                            break
-                    if not next_face:
-                        blocked[side_index] = True
-                        break
+                    prev_loop = curr_loop
                     curr_loop = nxt_loop
                     curr_face = next_face
                     final_loop = curr_loop
@@ -421,8 +434,8 @@ class MESH_OT_loop_sculpt(Operator):
             return None
         return edges
 
-    def _update_preview(self, context, bm, event_name):
-        edges = self._edges_for_step(bm, self.extend, event_name)
+    def _update_preview(self, context, bm, obj, event_name):
+        edges = self._edges_for_step(bm, obj, self.extend, event_name)
         if edges is None:
             return False
         if not edges:
@@ -431,7 +444,7 @@ class MESH_OT_loop_sculpt(Operator):
         for e in edges:
             if e.is_valid:
                 e.select = True
-        bmesh.update_edit_mesh(context.active_object.data, loop_triangles=False, destructive=False)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         return True
 
     def modal(self, context, event):
@@ -449,7 +462,7 @@ class MESH_OT_loop_sculpt(Operator):
             bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            if not self._update_preview(context, bm, "WHEELUP"):
+            if not self._update_preview(context, bm, obj, "WHEELUP"):
                 if self._last_blocked[0] and self._last_blocked[1]:
                     self.report({'WARNING'}, "Reached protected silhouette loop; stopping.")
                 _clear_status(context)
@@ -471,7 +484,7 @@ class MESH_OT_loop_sculpt(Operator):
             bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            if not self._update_preview(context, bm, "WHEELDOWN"):
+            if not self._update_preview(context, bm, obj, "WHEELDOWN"):
                 _clear_status(context)
                 return {'RUNNING_MODAL'}
             _status(context, self._status_text())
