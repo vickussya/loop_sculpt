@@ -320,27 +320,26 @@ class MESH_OT_loop_sculpt(Operator):
         loops = self._candidate_loops(bm)
         s = self._settings_snapshot
         try:
-            step = int(s.get('step', 1))
+            step = int(s.get('step', 2))
         except (TypeError, ValueError):
-            step = 1
+            step = 2
+        step = max(1, step)
 
-        candidates = []
-        if s.get('include_start', False):
-            candidates = loops
-        else:
-            candidates = loops[1:] if len(loops) > 1 else []
+        # Always start from the selected loop and alternate outward:
+        # selected, unselected, selected, unselected...
+        candidates = loops
 
         edges = set()
         if candidates:
             for idx, loop in enumerate(candidates):
-                if idx % max(1, step) == 0:
+                if idx % 2 == 0:
                     edges.update(loop)
 
         class _SettingsView:
             pass
         sv = _SettingsView()
         sv.step = step
-        sv.include_start = bool(s.get('include_start', False))
+        sv.include_start = True
         sv.limit_region = bool(s.get('limit_region', True))
         sv.vg_name = s.get('vg_name', "")
         sv.vg_threshold = float(s.get('vg_threshold', 0.0))
