@@ -28,25 +28,37 @@ def _debug_log(message):
     text = _debug_text()
     text.write(message + "\n")
 
-def _edge_by_index(bm, index):
-    try:
-        return bm.edges[index]
-    except (IndexError, TypeError):
+def _edge_key(edge):
+    v1, v2 = edge.verts
+    a = v1.index
+    b = v2.index
+    return (a, b) if a < b else (b, a)
+
+
+def _edge_from_key(bm, key):
+    a, b = key
+    if a >= len(bm.verts) or b >= len(bm.verts):
         return None
+    v1 = bm.verts[a]
+    v2 = bm.verts[b]
+    for e in v1.link_edges:
+        if v2 in e.verts:
+            return e
+    return None
 
 
-def _edges_from_indices(bm, indices):
+def _edges_from_keys(bm, keys):
     edges = set()
-    for idx in indices:
-        e = _edge_by_index(bm, idx)
+    for key in keys:
+        e = _edge_from_key(bm, key)
         if not e:
             return None
         edges.add(e)
     return edges
 
 
-def _loop_indices(edges):
-    return [e.index for e in edges]
+def _loop_keys(edges):
+    return {_edge_key(e) for e in edges}
 
 
 def _opposite_edge_in_face(face, edge):
@@ -313,23 +325,15 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("invoke: cancelled (selection too small)")
             return {'CANCELLED'}
 
-        start_edge = None
-        if bm.select_history and isinstance(bm.select_history[-1], bmesh.types.BMEdge):
-            start_edge = bm.select_history[-1]
-        if not start_edge:
-            for e in bm.edges:
-                if e.select:
-                    start_edge = e
-                    break
-        if not start_edge:
-            self.report({'WARNING'}, "Select an edge on a loop")
-            _debug_log("invoke: cancelled (no start edge)")
-            return {'CANCELLED'}
-
+        start_edge = selected_edges[0]
         base_loop = build_edge_loop(start_edge)
         if not base_loop or len(base_loop) < 2:
-            self.report({'WARNING'}, "No valid edge loop found")
+            self.report({'ERROR'}, "Select a full edge loop")
             _debug_log("invoke: cancelled (no valid loop)")
+            return {'CANCELLED'}
+        if len(base_loop) != len(selected_edges) or any(e not in base_loop for e in selected_edges):
+            self.report({'ERROR'}, "Selection must be a single edge loop")
+            _debug_log("invoke: cancelled (selection not a loop)")
             return {'CANCELLED'}
 
         settings = _settings_from_context(context)
@@ -341,8 +345,7 @@ class MESH_OT_loop_sculpt(Operator):
             self.report({'WARNING'}, f"Vertex group '{settings.vg_name}' not found")
             _debug_log("invoke: warning (vertex group missing)")
 
-        self._start_edge_index = start_edge.index
-        self._base_loop_indices = _loop_indices(base_loop)
+        self._base_loop_keys = _loop_keys(base_loop)
         self._orig_sel = {
             'edges': {e for e in bm.edges if e.select},
             'verts': {v for v in bm.verts if v.select},
@@ -353,7 +356,7 @@ class MESH_OT_loop_sculpt(Operator):
         self.extend = 0
         _status(context, self._status_text())
         context.window_manager.modal_handler_add(self)
-        _debug_log("invoke: running (base_loop_edges=%d)" % len(self._base_loop_indices))
+        _debug_log("invoke: running (base_loop_edges=%d)" % len(self._base_loop_keys))
         return {'RUNNING_MODAL'}
 
     def _status_text(self):
@@ -361,7 +364,7 @@ class MESH_OT_loop_sculpt(Operator):
         return f"Loop Sculpt | Extend: {self.extend} | Step: {s.get('step', 1)}"
 
     def _candidate_loops(self, bm, max_offset):
-        base_loop = _edges_from_indices(bm, self._base_loop_indices)
+        base_loop = _edges_from_keys(bm, self._base_loop_keys)
         if not base_loop:
             return None
         loops = expand_loops(base_loop, max_offset)
@@ -377,6 +380,14 @@ class MESH_OT_loop_sculpt(Operator):
             return set()
         # Always start from the selected loop and alternate outward:
         # selected, unselected, selected, unselected...
+        _debug_log(
+            "loops: extend=%d sizes=%s" %
+            (self.extend, [len(loop) for loop in loops])
+        )
+        if len(loops) - 1 < max_offset:
+            self.report({'WARNING'}, "Topology limits loop traversal; cannot extend further")
+            _debug_log("loops: limited by topology")
+            return set()
 
         obj = context.active_object
         if s.get('vg_name', "") and obj and not obj.vertex_groups.get(s.get('vg_name', "")):
@@ -400,7 +411,7 @@ class MESH_OT_loop_sculpt(Operator):
         sv.vg_threshold = float(s.get('vg_threshold', 0.0))
         sv.material_filter = s.get('material_filter', "NONE")
 
-        start_edge = _edge_by_index(bm, self._start_edge_index)
+        start_edge = next(iter(loops[0])) if loops and loops[0] else None
         if not start_edge:
             return None
         return apply_filters(context, bm, edges, sv, start_edge)
@@ -463,30 +474,23 @@ class MESH_OT_loop_sculpt(Operator):
             bm.edges.ensure_lookup_table()
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            edges = self._edges_to_dissolve(context, bm)
-            if edges is None:
-                self.report({'WARNING'}, "Edge loop data changed; restart the tool")
-                _debug_log("finish: cancelled (edge data changed)")
-                _clear_status(context)
-                return {'CANCELLED'}
-            if not edges:
-                self.report({'WARNING'}, "No edges matched filters")
-                _restore_selection(bm, self._orig_sel)
-                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-                _clear_status(context)
-                _debug_log("finish: cancelled (no edges matched)")
-                return {'CANCELLED'}
-            bmesh.ops.dissolve_edges(bm, edges=list(edges), use_verts=True)
-            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=True)
             _clear_status(context)
-            _debug_log("finish: applied")
+            self.report({'INFO'}, "Loop Sculpt finished; selection kept")
+            _debug_log("finish: selection kept")
             return {'FINISHED'}
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
             obj, bm = _active_bm(context)
             if bm:
-                _restore_selection(bm, self._orig_sel)
-                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+                base_loop = _edges_from_keys(bm, self._base_loop_keys)
+                if base_loop:
+                    _deselect_all(bm)
+                    for e in base_loop:
+                        e.select = True
+                    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+                else:
+                    _restore_selection(bm, self._orig_sel)
+                    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
             _clear_status(context)
             self.report({'INFO'}, "Loop Sculpt cancelled; selection restored")
             _debug_log("cancel: restored selection")
