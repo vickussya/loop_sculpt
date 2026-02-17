@@ -1,14 +1,7 @@
 ﻿import bpy
 import bmesh
-from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import (
-    BoolProperty,
-    EnumProperty,
-    FloatProperty,
-    IntProperty,
-    PointerProperty,
-    StringProperty,
-)
+from bpy.types import Operator, Panel
+from bpy.props import IntProperty
 
 
 def _active_bm(context):
@@ -110,87 +103,6 @@ def build_edge_loop(edge):
     return loop
 
 
-def expand_loops(base_loop, steps):
-    loops = [set(base_loop)]
-    visited = set(base_loop)
-    current = set(base_loop)
-    for _i in range(steps):
-        neighbor_seeds = set()
-        for e in current:
-            for f in e.link_faces:
-                if len(f.verts) != 4:
-                    continue
-                opp = _opposite_edge_in_face(f, e)
-                if opp and opp not in visited:
-                    neighbor_seeds.add(opp)
-        if not neighbor_seeds:
-            break
-        neighbor_loop = set()
-        for seed in neighbor_seeds:
-            if seed in visited:
-                continue
-            neighbor_loop.update(build_edge_loop(seed))
-        if not neighbor_loop:
-            break
-        loops.append(neighbor_loop)
-        visited.update(neighbor_loop)
-        current = neighbor_loop
-    return loops
-
-
-def connected_edge_region(start_edge):
-    region = set()
-    stack = [start_edge]
-    while stack:
-        e = stack.pop()
-        if e in region:
-            continue
-        region.add(e)
-        for v in e.verts:
-            for linked in v.link_edges:
-                if linked not in region:
-                    stack.append(linked)
-    return region
-
-
-def apply_filters(context, bm, edges, settings, start_edge):
-    obj = context.active_object
-    if not edges:
-        return set()
-
-    filtered = set(edges)
-
-    if settings.limit_region:
-        region = connected_edge_region(start_edge)
-        filtered = {e for e in filtered if e in region}
-
-    if settings.vg_name:
-        group = obj.vertex_groups.get(settings.vg_name)
-        if not group:
-            return set()
-        dlayer = bm.verts.layers.deform.verify()
-        thresh = settings.vg_threshold
-        def has_weight(v):
-            weights = v[dlayer]
-            return weights.get(group.index, 0.0) >= thresh
-        filtered = {e for e in filtered if has_weight(e.verts[0]) and has_weight(e.verts[1])}
-
-    if settings.material_filter != "NONE":
-        try:
-            mat_index = int(settings.material_filter)
-        except ValueError:
-            mat_index = -1
-        if mat_index >= 0:
-            def has_mat(e):
-                for f in e.link_faces:
-                    if f.material_index == mat_index:
-                        return True
-                return False
-            filtered = {e for e in filtered if has_mat(e)}
-
-    return filtered
-
-
 def _deselect_all(bm):
     for e in bm.edges:
         e.select = False
@@ -222,79 +134,81 @@ def _clear_status(context):
     if context.workspace:
         context.workspace.status_text_set(None)
 
+def _validate_loop_edges(edges):
+    if not edges or len(edges) < 2:
+        return False, "selection too small"
+    edge_set = set(edges)
+    neighbors = {}
+    for e in edge_set:
+        linked = set()
+        for v in e.verts:
+            for le in v.link_edges:
+                if le in edge_set and le is not e:
+                    linked.add(le)
+        neighbors[e] = linked
+    counts = [len(neighbors[e]) for e in edge_set]
+    if any(c > 2 for c in counts):
+        return False, "branching selection"
+    ones = sum(1 for c in counts if c == 1)
+    twos = sum(1 for c in counts if c == 2)
+    if not (ones == 0 or ones == 2):
+        return False, "not a loop chain"
+    if ones == 2 and twos + ones != len(edge_set):
+        return False, "not a single chain"
+    start = next(iter(edge_set))
+    visited = {start}
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        for n in neighbors[cur]:
+            if n not in visited:
+                visited.add(n)
+                stack.append(n)
+    if len(visited) != len(edge_set):
+        return False, "selection not connected"
+    return True, ""
 
-def _is_deferred(value):
-    return value is None or type(value).__name__ == "_PropertyDeferred"
 
-
-def _settings_from_context(context):
-    settings = getattr(context.scene, "loop_sculpt_settings", None)
-    if _is_deferred(settings):
+def _neighbor_loop(bm, loop_edges):
+    candidates = set()
+    for e in loop_edges:
+        for f in e.link_faces:
+            if len(f.verts) != 4:
+                continue
+            opp = _opposite_edge_in_face(f, e)
+            if opp:
+                candidates.add(opp)
+    if not candidates:
         return None
-    return settings
-
-
-def _prop_value(value, default):
-    if _is_deferred(value):
-        return default
-    return value
-
-
-def _snapshot_settings(settings):
-    return {
-        'step': int(_prop_value(settings.step, 2)),
-        'include_start': bool(_prop_value(settings.include_start, False)),
-        'limit_region': bool(_prop_value(settings.limit_region, True)),
-        'vg_name': str(_prop_value(settings.vg_name, "")),
-        'vg_threshold': float(_prop_value(settings.vg_threshold, 0.1)),
-        'material_filter': str(_prop_value(settings.material_filter, "NONE")),
-    }
-
-
-class LoopSculptSettings(PropertyGroup):
-    step: IntProperty(
-        name="Step",
-        description="Dissolve every Nth loop",
-        default=2,
-        min=1,
-        max=100,
-    )
-    include_start: BoolProperty(
-        name="Include Starting Loop",
-        description="Allow dissolving the starting loop",
-        default=False,
-    )
-    limit_region: BoolProperty(
-        name="Limit to Connected Region",
-        default=True,
-    )
-    vg_name: StringProperty(
-        name="Vertex Group",
-        description="Only dissolve edges where both vertices are in this group",
-        default="HAIR",
-    )
-    vg_threshold: FloatProperty(
-        name="Weight Threshold",
-        default=0.1,
-        min=0.0,
-        max=1.0,
-        subtype='FACTOR',
-    )
-
-    def _material_items(self, context):
-        items = [("NONE", "None", "No material filter")]
-        obj = context.active_object
-        if obj and obj.type == 'MESH':
-            for idx, slot in enumerate(obj.material_slots):
-                name = slot.material.name if slot.material else f"Slot {idx}"
-                items.append((str(idx), name, ""))
-        return items
-
-    material_filter: EnumProperty(
-        name="Material",
-        description="Only dissolve edges connected to faces with this material",
-        items=_material_items,
-    )
+    # Split candidates into connected components and keep one coherent loop.
+    components = []
+    remaining = set(candidates)
+    while remaining:
+        start = next(iter(remaining))
+        comp = {start}
+        stack = [start]
+        remaining.remove(start)
+        while stack:
+            cur = stack.pop()
+            for v in cur.verts:
+                for le in v.link_edges:
+                    if le in remaining:
+                        remaining.remove(le)
+                        comp.add(le)
+                        stack.append(le)
+        components.append(comp)
+    valid = []
+    for comp in components:
+        ok, _reason = _validate_loop_edges(comp)
+        if ok:
+            valid.append(comp)
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return valid[0]
+    # Deterministic pick if two sides exist.
+    valid.sort(key=lambda c: sorted(_loop_keys(c))[0])
+    return valid[0]
 
 
 class MESH_OT_loop_sculpt(Operator):
@@ -321,7 +235,7 @@ class MESH_OT_loop_sculpt(Operator):
             (context.mode, obj.name if obj else "None", len(selected_edges))
         )
         if len(selected_edges) < 2:
-            self.report({'ERROR'}, "Select an entire edge loop (at least 2 edges)")
+            self.report({'ERROR'}, "Select a full edge loop (at least 2 edges)")
             _debug_log("invoke: cancelled (selection too small)")
             return {'CANCELLED'}
 
@@ -331,19 +245,11 @@ class MESH_OT_loop_sculpt(Operator):
             self.report({'ERROR'}, "Select a full edge loop")
             _debug_log("invoke: cancelled (no valid loop)")
             return {'CANCELLED'}
-        if len(base_loop) != len(selected_edges) or any(e not in base_loop for e in selected_edges):
+        ok, reason = _validate_loop_edges(selected_edges)
+        if not ok:
             self.report({'ERROR'}, "Selection must be a single edge loop")
-            _debug_log("invoke: cancelled (selection not a loop)")
+            _debug_log("invoke: cancelled (selection invalid: %s)" % reason)
             return {'CANCELLED'}
-
-        settings = _settings_from_context(context)
-        if not settings:
-            self.report({'ERROR'}, "Loop Sculpt settings missing. Reinstall the add-on.")
-            _debug_log("invoke: cancelled (settings missing)")
-            return {'CANCELLED'}
-        if settings.vg_name and obj and not obj.vertex_groups.get(settings.vg_name):
-            self.report({'WARNING'}, f"Vertex group '{settings.vg_name}' not found")
-            _debug_log("invoke: warning (vertex group missing)")
 
         self._base_loop_keys = _loop_keys(base_loop)
         self._orig_sel = {
@@ -351,7 +257,6 @@ class MESH_OT_loop_sculpt(Operator):
             'verts': {v for v in bm.verts if v.select},
             'faces': {f for f in bm.faces if f.select},
         }
-        self._settings_snapshot = _snapshot_settings(settings)
 
         self.extend = 0
         _status(context, self._status_text())
@@ -360,64 +265,34 @@ class MESH_OT_loop_sculpt(Operator):
         return {'RUNNING_MODAL'}
 
     def _status_text(self):
-        s = self._settings_snapshot
-        return f"Loop Sculpt | Extend: {self.extend} | Step: {s.get('step', 1)}"
+        return f"Loop Sculpt | Extend: {self.extend}"
 
-    def _candidate_loops(self, bm, max_offset):
+    def _edges_for_step(self, bm, step):
         base_loop = _edges_from_keys(bm, self._base_loop_keys)
         if not base_loop:
             return None
-        loops = expand_loops(base_loop, max_offset)
-        return loops
-
-    def _edges_to_dissolve(self, context, bm):
-        s = self._settings_snapshot
-        max_offset = max(0, self.extend * 2)
-        loops = self._candidate_loops(bm, max_offset)
-        if loops is None:
-            return None
-        if not loops:
-            return set()
-        # Always start from the selected loop and alternate outward:
-        # selected, unselected, selected, unselected...
-        _debug_log(
-            "loops: extend=%d sizes=%s" %
-            (self.extend, [len(loop) for loop in loops])
-        )
-        if len(loops) - 1 < max_offset:
-            self.report({'WARNING'}, "Topology limits loop traversal; cannot extend further")
-            _debug_log("loops: limited by topology")
-            return set()
-
-        obj = context.active_object
-        if s.get('vg_name', "") and obj and not obj.vertex_groups.get(s.get('vg_name', "")):
-            self.report({'WARNING'}, f"Vertex group '{s.get('vg_name', '')}' not found; filter disabled")
-            s = dict(s)
-            s['vg_name'] = ""
-            _debug_log("filter: disabled missing vertex group")
-
+        selected_loops = [base_loop]
+        current = base_loop
+        for _i in range(step):
+            n1 = _neighbor_loop(bm, current)
+            if not n1:
+                return None
+            n2 = _neighbor_loop(bm, n1)
+            if not n2:
+                return None
+            selected_loops.append(n2)
+            current = n2
         edges = set()
-        for idx, loop in enumerate(loops):
-            if idx % 2 == 0:
-                edges.update(loop)
-
-        class _SettingsView:
-            pass
-        sv = _SettingsView()
-        sv.step = 2
-        sv.include_start = True
-        sv.limit_region = bool(s.get('limit_region', True))
-        sv.vg_name = s.get('vg_name', "")
-        sv.vg_threshold = float(s.get('vg_threshold', 0.0))
-        sv.material_filter = s.get('material_filter', "NONE")
-
-        start_edge = next(iter(loops[0])) if loops and loops[0] else None
-        if not start_edge:
-            return None
-        return apply_filters(context, bm, edges, sv, start_edge)
+        for loop in selected_loops:
+            edges.update(loop)
+        _debug_log(
+            "loops: step=%d sizes=%s" %
+            (step, [len(loop) for loop in selected_loops])
+        )
+        return edges
 
     def _update_preview(self, context, bm):
-        edges = self._edges_to_dissolve(context, bm)
+        edges = self._edges_for_step(bm, self.extend)
         if edges is None:
             return False
         if not edges:
@@ -440,10 +315,11 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
-                self.report({'WARNING'}, "Edge loop data changed; restart the tool")
+                self.report({'WARNING'}, "Topology limits loop traversal; cannot extend further")
                 _debug_log("wheel up: cancelled (edge data changed)")
                 _clear_status(context)
-                return {'CANCELLED'}
+                self.extend = max(0, self.extend - 1)
+                return {'RUNNING_MODAL'}
             _status(context, self._status_text())
             _debug_log("wheel up: extend=%d" % self.extend)
             return {'RUNNING_MODAL'}
@@ -458,28 +334,24 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
-                self.report({'WARNING'}, "Edge loop data changed; restart the tool")
+                self.report({'WARNING'}, "Topology limits loop traversal; cannot shrink further")
                 _debug_log("wheel down: cancelled (edge data changed)")
                 _clear_status(context)
-                return {'CANCELLED'}
+                return {'RUNNING_MODAL'}
             _status(context, self._status_text())
             _debug_log("wheel down: extend=%d" % self.extend)
             return {'RUNNING_MODAL'}
 
         if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'}:
-            obj, bm = _active_bm(context)
-            if not bm:
-                _debug_log("finish: cancelled (no edit mesh)")
-                return {'CANCELLED'}
-            bm.edges.ensure_lookup_table()
-            bm.verts.ensure_lookup_table()
-            bm.faces.ensure_lookup_table()
+            return {'RUNNING_MODAL'}
+
+        if event.type in {'RIGHTMOUSE'}:
             _clear_status(context)
             self.report({'INFO'}, "Loop Sculpt finished; selection kept")
             _debug_log("finish: selection kept")
             return {'FINISHED'}
 
-        if event.type in {'RIGHTMOUSE', 'ESC'}:
+        if event.type in {'ESC'}:
             obj, bm = _active_bm(context)
             if bm:
                 base_loop = _edges_from_keys(bm, self._base_loop_keys)
@@ -513,42 +385,17 @@ class VIEW3D_PT_loop_sculpt(Panel):
 
     def draw(self, context):
         layout = self.layout
-        settings = _settings_from_context(context)
-        if not settings:
-            layout.label(text="Settings missing; reinstall the add-on.")
-            return
-
         layout.operator(MESH_OT_loop_sculpt.bl_idname, text="Loop Sculpt")
-        layout.prop(settings, "step")
-        layout.prop(settings, "include_start")
-        layout.prop(settings, "limit_region")
-
-        col = layout.column(align=True)
-        col.label(text="Hair Filters")
-        obj = context.active_object
-        if settings.vg_name and obj and not obj.vertex_groups.get(settings.vg_name):
-            col.label(text=f"Vertex group '{settings.vg_name}' not found", icon='ERROR')
-        if obj:
-            col.prop_search(settings, "vg_name", obj, "vertex_groups", text="Vertex Group")
-        else:
-            col.prop(settings, "vg_name")
-        col.prop(settings, "vg_threshold")
-        col.prop(settings, "material_filter")
 
 
 def register():
-    bpy.utils.register_class(LoopSculptSettings)
     bpy.utils.register_class(MESH_OT_loop_sculpt)
     bpy.utils.register_class(VIEW3D_PT_loop_sculpt)
-    bpy.types.Scene.loop_sculpt_settings = PointerProperty(type=LoopSculptSettings)
 
 
 def unregister():
-    if hasattr(bpy.types.Scene, "loop_sculpt_settings"):
-        del bpy.types.Scene.loop_sculpt_settings
     bpy.utils.unregister_class(VIEW3D_PT_loop_sculpt)
     bpy.utils.unregister_class(MESH_OT_loop_sculpt)
-    bpy.utils.unregister_class(LoopSculptSettings)
 
 
 if __name__ == "__main__":
