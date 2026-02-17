@@ -4,8 +4,10 @@ Loop Sculpt is a selection-only Blender add-on for stepping edge loop selection 
 
 ## Features
 - Selection-only loop stepping (no geometry changes)
-- Mouse wheel adds/removes loops with skip-one spacing
+- Mouse wheel expands and shrinks symmetrically on both sides
+- Skip Loops setting (1-5) to control spacing
 - UI button activation (no shortcuts)
+- Border/corner loop exclusion (boundary loops are never selected)
 
 ## Installation (Blender 3.6+ / 4.x)
 1. Download `loop_sculpt.zip` from the GitHub Releases page.
@@ -20,11 +22,12 @@ Loop Sculpt is a selection-only Blender add-on for stepping edge loop selection 
 2. Alt+Click to select a single edge loop.
 3. Open **View3D > Sidebar > Loop Sculpt** and click **Loop Sculpt**.
 4. Hover the mouse over the 3D Viewport and use the mouse wheel:
-   - Wheel Up: add one loop using skip-one spacing.
-   - Wheel Down: remove one added loop.
+   - Wheel Up: add outer loops on both sides using skip spacing.
+   - Wheel Down: remove the last added loops.
 5. Confirm with **Left Mouse** (selection stays).
 6. Cancel with **Esc** or **Right Mouse** (selection returns to the original loop).
 
 ## Notes
 - Best on quad-based topology.
 - The tool only changes selection; it never modifies geometry.
+- Boundary/border loops are never selected.
