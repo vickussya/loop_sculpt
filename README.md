@@ -10,12 +10,11 @@ Loop Sculpt is a selection-only Blender add-on for stepping edge loop selection 
 - Border/corner loop exclusion (boundary loops are never selected)
 
 ## Installation (Blender 3.6+ / 4.x)
-1. Download `loop_sculpt.zip` from the GitHub Releases page.
+1. Download `loop_sculpt.zip` from the GitHub Releases page or use the GitHub **Download ZIP** button.
    - The ZIP contains: `__init__.py` and `loop_sculpt.py` at the top level.
-2. Note: the GitHub "Download ZIP" is **not** installable directly because GitHub wraps the repo in a `loop_sculpt-main/` folder, which Blender treats as an invalid module name.
-3. In Blender, go to **Edit > Preferences > Add-ons**.
-4. Click **Install...** and select the ZIP file.
-5. Enable the add-on by checking **Loop Sculpt** in the add-ons list.
+2. In Blender, go to **Edit > Preferences > Add-ons**.
+3. Click **Install...** and select the ZIP file.
+4. Enable the add-on by checking **Loop Sculpt** in the add-ons list.
 
 ## Usage
 1. Enter **Edit Mode** on a mesh and use **Edge Select**.
