@@ -17,6 +17,26 @@ def _active_bm(context):
         return None, None
     return obj, bmesh.from_edit_mesh(obj.data)
 
+def _edge_by_index(bm, index):
+    try:
+        return bm.edges[index]
+    except (IndexError, TypeError):
+        return None
+
+
+def _edges_from_indices(bm, indices):
+    edges = set()
+    for idx in indices:
+        e = _edge_by_index(bm, idx)
+        if not e:
+            return None
+        edges.add(e)
+    return edges
+
+
+def _loop_indices(edges):
+    return [e.index for e in edges]
+
 
 def _opposite_edge_in_face(face, edge):
     v1, v2 = edge.verts
@@ -271,6 +291,10 @@ class MESH_OT_loop_sculpt(Operator):
         bm.verts.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
 
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
         start_edge = None
         if bm.select_history and isinstance(bm.select_history[-1], bmesh.types.BMEdge):
             start_edge = bm.select_history[-1]
@@ -293,8 +317,8 @@ class MESH_OT_loop_sculpt(Operator):
             self.report({'ERROR'}, "Loop Sculpt settings missing. Reinstall the add-on.")
             return {'CANCELLED'}
 
-        self._start_edge = start_edge
-        self._base_loop = base_loop
+        self._start_edge_index = start_edge.index
+        self._base_loop_indices = _loop_indices(base_loop)
         self._orig_sel = {
             'edges': {e for e in bm.edges if e.select},
             'verts': {v for v in bm.verts if v.select},
@@ -312,48 +336,55 @@ class MESH_OT_loop_sculpt(Operator):
         s = self._settings_snapshot
         return f"Loop Sculpt | Extend: {self.extend} | Step: {s.get('step', 1)}"
 
-    def _candidate_loops(self, bm):
-        loops = expand_loops(self._base_loop, self.extend)
+    def _candidate_loops(self, bm, max_offset):
+        base_loop = _edges_from_indices(bm, self._base_loop_indices)
+        if not base_loop:
+            return None
+        loops = expand_loops(base_loop, max_offset)
         return loops
 
     def _edges_to_dissolve(self, context, bm):
-        loops = self._candidate_loops(bm)
         s = self._settings_snapshot
-        try:
-            step = int(s.get('step', 2))
-        except (TypeError, ValueError):
-            step = 2
-        step = max(1, step)
-
+        max_offset = max(0, self.extend * 2)
+        loops = self._candidate_loops(bm, max_offset)
+        if loops is None:
+            return None
+        if not loops:
+            return set()
+        s = self._settings_snapshot
         # Always start from the selected loop and alternate outward:
         # selected, unselected, selected, unselected...
-        candidates = loops
 
         edges = set()
-        if candidates:
-            for idx, loop in enumerate(candidates):
-                if idx % 2 == 0:
-                    edges.update(loop)
+        for idx, loop in enumerate(loops):
+            if idx % 2 == 0:
+                edges.update(loop)
 
         class _SettingsView:
             pass
         sv = _SettingsView()
-        sv.step = step
+        sv.step = 2
         sv.include_start = True
         sv.limit_region = bool(s.get('limit_region', True))
         sv.vg_name = s.get('vg_name', "")
         sv.vg_threshold = float(s.get('vg_threshold', 0.0))
         sv.material_filter = s.get('material_filter', "NONE")
 
-        return apply_filters(context, bm, edges, sv, self._start_edge)
+        start_edge = _edge_by_index(bm, self._start_edge_index)
+        if not start_edge:
+            return None
+        return apply_filters(context, bm, edges, sv, start_edge)
 
     def _update_preview(self, context, bm):
         edges = self._edges_to_dissolve(context, bm)
+        if edges is None:
+            return False
         _deselect_all(bm)
         for e in edges:
             if e.is_valid:
                 e.select = True
         bmesh.update_edit_mesh(context.active_object.data, loop_triangles=False, destructive=False)
+        return True
 
     def modal(self, context, event):
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
@@ -361,7 +392,13 @@ class MESH_OT_loop_sculpt(Operator):
             obj, bm = _active_bm(context)
             if not bm:
                 return {'CANCELLED'}
-            self._update_preview(context, bm)
+            bm.edges.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            if not self._update_preview(context, bm):
+                self.report({'WARNING'}, "Edge loop data changed; restart the tool")
+                _clear_status(context)
+                return {'CANCELLED'}
             _status(context, self._status_text())
             return {'RUNNING_MODAL'}
 
@@ -370,7 +407,13 @@ class MESH_OT_loop_sculpt(Operator):
             obj, bm = _active_bm(context)
             if not bm:
                 return {'CANCELLED'}
-            self._update_preview(context, bm)
+            bm.edges.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            if not self._update_preview(context, bm):
+                self.report({'WARNING'}, "Edge loop data changed; restart the tool")
+                _clear_status(context)
+                return {'CANCELLED'}
             _status(context, self._status_text())
             return {'RUNNING_MODAL'}
 
@@ -378,7 +421,14 @@ class MESH_OT_loop_sculpt(Operator):
             obj, bm = _active_bm(context)
             if not bm:
                 return {'CANCELLED'}
+            bm.edges.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
             edges = self._edges_to_dissolve(context, bm)
+            if edges is None:
+                self.report({'WARNING'}, "Edge loop data changed; restart the tool")
+                _clear_status(context)
+                return {'CANCELLED'}
             if not edges:
                 self.report({'WARNING'}, "No edges matched filters")
                 _restore_selection(bm, self._orig_sel)
