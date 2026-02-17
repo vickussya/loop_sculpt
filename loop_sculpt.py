@@ -226,14 +226,26 @@ def _get_loop_from_seed_edge(bm, obj, area, region, seed_edge):
     return loop
 
 
-def _neighbor_on_side(bm, obj, area, region, loop_edges, seed_face, prev_loop):
+def _adjacent_loop_on_side(bm, obj, area, region, loop_edges, seed_face_index, prev_loop):
+    seed_face = None
+    for f in bm.faces:
+        if f.index == seed_face_index:
+            seed_face = f
+            break
+    if not seed_face:
+        return None, None, None
+
     e0 = None
     for e in loop_edges:
-        if seed_face in e.link_faces:
-            e0 = e
+        for f in e.link_faces:
+            if f.index == seed_face_index:
+                e0 = e
+                break
+        if e0:
             break
     if not e0:
-        return None, None, None
+        e0 = _representative_edge(loop_edges)
+
     if len(seed_face.verts) != 4:
         return None, None, None
     opp = _opposite_edge_in_face(seed_face, e0)
@@ -247,13 +259,7 @@ def _neighbor_on_side(bm, obj, area, region, loop_edges, seed_face, prev_loop):
     if prev_loop and _loop_keys(loop) == _loop_keys(prev_loop):
         return None, None, None
 
-    next_face = None
-    for f in opp.link_faces:
-        if f is not seed_face and len(f.verts) == 4:
-            next_face = f
-            break
-
-    return loop, opp, next_face
+    return loop, opp, (e0.verts[0].index, e0.verts[1].index)
 
 
 class LoopSculptSettings(PropertyGroup):
@@ -328,6 +334,13 @@ class MESH_OT_loop_sculpt(Operator):
         self._protect_angle_deg = settings.protect_angle_deg if settings else 45
         self._disable_protection = settings.disable_protection if settings else False
 
+        e0 = _representative_edge(selected_edges)
+        faces = [f for f in e0.link_faces if len(f.verts) == 4]
+        if len(faces) < 2:
+            self.report({'WARNING'}, "Only one quad side found; expansion may be one-sided")
+        self._sideA_face_index = faces[0].index if len(faces) > 0 else -1
+        self._sideB_face_index = faces[1].index if len(faces) > 1 else -1
+
         self.extend = 0
         _status(context, self._status_text())
         context.window_manager.modal_handler_add(self)
@@ -344,10 +357,6 @@ class MESH_OT_loop_sculpt(Operator):
 
         hop = self._skip_loops + 1
 
-        e0 = _representative_edge(base_loop)
-        side_faces = [f for f in e0.link_faces if len(f.verts) == 4]
-        side_faces = side_faces[:2]
-
         selected_loops = [base_loop]
         blocked = [False, False]
         added = [False, False]
@@ -361,36 +370,36 @@ class MESH_OT_loop_sculpt(Operator):
         ))
         _debug_log("base_loop: edges=%d" % len(base_loop))
 
+        side_faces = [self._sideA_face_index, self._sideB_face_index]
+        side_counts = [0, 0]
+
         for side_index in range(2):
-            if side_index >= len(side_faces):
+            if side_faces[side_index] < 0:
                 blocked[side_index] = True
                 continue
 
             curr_loop = base_loop
-            curr_face = side_faces[side_index]
             prev_loop = None
             final_loop = None
-            final_opp = None
+            seed_edge_key = None
 
             for _step in range(step):
                 for _hop in range(hop):
-                    nxt_loop, opp, next_face = _neighbor_on_side(
+                    nxt_loop, opp, seed_edge_key = _adjacent_loop_on_side(
                         bm,
                         obj,
                         self._area,
                         self._region,
                         curr_loop,
-                        curr_face,
+                        side_faces[side_index],
                         prev_loop,
                     )
-                    if not nxt_loop or not next_face:
+                    if not nxt_loop:
                         blocked[side_index] = True
                         break
                     prev_loop = curr_loop
                     curr_loop = nxt_loop
-                    curr_face = next_face
                     final_loop = curr_loop
-                    final_opp = opp
                 if blocked[side_index]:
                     break
 
@@ -413,10 +422,16 @@ class MESH_OT_loop_sculpt(Operator):
             ))
             _debug_log("    sample_protected_edges=%s" % sample_edges)
             _debug_log("    sample_angles_deg=%s" % [round(a, 2) for a in sample_angles])
+            _debug_log("    seed_face_index=%d, hop=%d, chosen_seed_edge=%s" % (
+                side_faces[side_index],
+                hop,
+                seed_edge_key,
+            ))
 
             if final_loop and (self._disable_protection or not protected):
                 selected_loops.append(final_loop)
                 added[side_index] = True
+                side_counts[side_index] += 1
             else:
                 blocked[side_index] = True
 
@@ -426,6 +441,8 @@ class MESH_OT_loop_sculpt(Operator):
 
         _debug_log("result:")
         _debug_log("    added_sideA=%s, added_sideB=%s" % (added[0], added[1]))
+        _debug_log("    selected_loops_sideA_count=%d" % side_counts[0])
+        _debug_log("    selected_loops_sideB_count=%d" % side_counts[1])
 
         self._last_blocked = blocked
         self._last_added = added
