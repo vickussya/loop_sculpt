@@ -287,6 +287,17 @@ def _get_ring_edges_from_seed(bm, obj, area, region, window, seed_edge):
     return ring_edges
 
 
+def _edges_share_ring_vertices(loop_edges, ring_edges):
+    ring_verts = set()
+    for e in ring_edges:
+        ring_verts.update(e.verts)
+    for e in loop_edges:
+        for v in e.verts:
+            if v in ring_verts:
+                return True
+    return False
+
+
 class LoopSculptSettings(PropertyGroup):
     skip_loops: IntProperty(
         name="Skip Loops",
@@ -381,6 +392,10 @@ class MESH_OT_loop_sculpt(Operator):
             loop = _get_loop_from_seed_edge(bm, obj, self._area, self._region, self._win, seed)
             if not loop:
                 break
+            if not _edges_share_ring_vertices(loop, ring_edges):
+                _debug_log("strip: discard loop (not in base strip)")
+                unassigned -= loop
+                continue
             loop_set = set(_loop_keys(loop))
             if len(loop_set) != len(base_loop_set):
                 _debug_log("dedupe: discard loop (size mismatch)")
@@ -418,6 +433,7 @@ class MESH_OT_loop_sculpt(Operator):
             projections.append((proj, loop))
         projections.sort(key=lambda x: x[0])
         self._ordered_loops = [loop for _, loop in projections]
+        self._ordered_projections = [proj for proj, _ in projections]
 
         # Determine base index.
         base_keys = set(self._base_loop_keys)
@@ -509,6 +525,13 @@ class MESH_OT_loop_sculpt(Operator):
 
         _debug_log("hop=%d step_count=%d" % (hop, step_count))
         _debug_log("chosen_indices=%s" % sorted(set(chosen_indices)))
+        _debug_log("base_i=%d total_loops=%d" % (base_index, len(loops)))
+        selected_indices = sorted({base_index} | {base_index + k * hop for k in range(1, step_count + 1)} | {base_index - k * hop for k in range(1, step_count + 1)})
+        _debug_log("selected_indices=%s" % selected_indices)
+        for idx in selected_indices:
+            if 0 <= idx < len(loops):
+                proj = self._ordered_projections[idx] if hasattr(self, "_ordered_projections") else 0.0
+                _debug_log("idx=%d proj=%.6f" % (idx, proj))
         for idx, reason in blocked:
             _debug_log("blocked idx=%s reason=%s" % (idx, reason))
 
