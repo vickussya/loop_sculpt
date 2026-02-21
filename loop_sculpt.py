@@ -503,16 +503,18 @@ class MESH_OT_loop_sculpt(Operator):
         if step == 0:
             return edges
 
-        hop = self._skip_loops
-        for k in range(1, step + 1):
-            idx_pos = self._base_index + k * hop
-            idx_neg = self._base_index - k * hop
+        skip = max(1, int(self._skip_loops))
+        for dist in range(1, step + 1):
+            if dist % skip != 0:
+                continue
+            idx_pos = self._base_index + dist
+            idx_neg = self._base_index - dist
             if 0 <= idx_pos < len(self._ordered_loops):
                 add_loop(self._ordered_loops[idx_pos])
             if 0 <= idx_neg < len(self._ordered_loops):
                 add_loop(self._ordered_loops[idx_neg])
 
-        _debug_log("loops: step=%d total=%d" % (step, len(edges)))
+        _debug_log("loops: step=%d skip=%d total=%d" % (step, skip, len(edges)))
         return edges
 
     def _update_preview(self, context, bm):
@@ -532,11 +534,10 @@ class MESH_OT_loop_sculpt(Operator):
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS', 'WHEELINMOUSE'}:
             if context.area and context.area.type != 'VIEW_3D':
                 return {'RUNNING_MODAL'}
-            hop = self._skip_loops
             next_step = self.extend + 1
-            idx_pos = self._base_index + next_step * hop
-            idx_neg = self._base_index - next_step * hop
-            if idx_pos >= len(self._ordered_loops) and idx_neg < 0:
+            max_left = self._base_index
+            max_right = (len(self._ordered_loops) - 1) - self._base_index
+            if next_step > max_left and next_step > max_right:
                 if not self._notified_limit:
                     self.report({'INFO'}, "Reached end")
                     self._notified_limit = True
