@@ -4,7 +4,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar",
-    "description": "Loop selection and dissolve helper",
+    "description": "Loop selection helper",
     "category": "Mesh",
 }
 

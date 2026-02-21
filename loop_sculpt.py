@@ -1,4 +1,4 @@
-import bpy
+﻿import bpy
 import bmesh
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import IntProperty, PointerProperty
@@ -10,7 +10,6 @@ def _active_bm(context):
         return None, None
     return obj, bmesh.from_edit_mesh(obj.data)
 
-
 def _debug_text():
     text = bpy.data.texts.get("LoopSculpt_Debug")
     if text is None:
@@ -21,7 +20,6 @@ def _debug_text():
 def _debug_log(message):
     text = _debug_text()
     text.write(message + "\n")
-
 
 def _edge_key(edge):
     v1, v2 = edge.verts
@@ -67,14 +65,6 @@ def _opposite_edge_in_face(face, edge):
     return None
 
 
-def _is_boundary_edge(edge):
-    return len(edge.link_faces) != 2
-
-
-def _loop_is_boundary(loop_edges):
-    return any(_is_boundary_edge(e) for e in loop_edges)
-
-
 def _deselect_all(bm):
     for e in bm.edges:
         e.select = False
@@ -110,7 +100,6 @@ def _clear_status(context):
 def _settings_from_context(context):
     return getattr(context.scene, "loop_sculpt_settings", None)
 
-
 def _validate_loop_edges(edges):
     if not edges or len(edges) < 2:
         return False, "selection too small"
@@ -144,6 +133,48 @@ def _validate_loop_edges(edges):
     if len(visited) != len(edge_set):
         return False, "selection not connected"
     return True, ""
+
+
+def _neighbor_loop(bm, loop_edges):
+    candidates = set()
+    for e in loop_edges:
+        for f in e.link_faces:
+            if len(f.verts) != 4:
+                continue
+            opp = _opposite_edge_in_face(f, e)
+            if opp:
+                candidates.add(opp)
+    if not candidates:
+        return None
+    # Split candidates into connected components and keep one coherent loop.
+    components = []
+    remaining = set(candidates)
+    while remaining:
+        start = next(iter(remaining))
+        comp = {start}
+        stack = [start]
+        remaining.remove(start)
+        while stack:
+            cur = stack.pop()
+            for v in cur.verts:
+                for le in v.link_edges:
+                    if le in remaining:
+                        remaining.remove(le)
+                        comp.add(le)
+                        stack.append(le)
+        components.append(comp)
+    valid = []
+    for comp in components:
+        ok, _reason = _validate_loop_edges(comp)
+        if ok:
+            valid.append(comp)
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return valid[0]
+    # Deterministic pick if two sides exist.
+    valid.sort(key=lambda c: sorted(_loop_keys(c))[0])
+    return valid[0]
 
 
 def _neighbor_loops(bm, loop_edges):
@@ -195,10 +226,21 @@ def _next_loop(bm, prev_loop, curr_loop):
     return None
 
 
+def _step_loop(bm, prev_loop, curr_loop, steps):
+    prev = prev_loop
+    curr = curr_loop
+    for _i in range(1, steps):
+        nxt = _next_loop(bm, prev, curr)
+        if not nxt:
+            return None
+        prev, curr = curr, nxt
+    return curr
+
+
 class LoopSculptSettings(PropertyGroup):
     skip_loops: IntProperty(
         name="Skip Loops",
-        description="Number of loops to skip between selected loops",
+        description="Select every Nth loop (skip N-1 in between)",
         default=2,
         min=1,
         max=5,
@@ -247,40 +289,12 @@ class MESH_OT_loop_sculpt(Operator):
         }
 
         settings = _settings_from_context(context)
-        self._skip_loops = settings.skip_loops if settings else 1
-        self._notified_limit = False
-
-        base_loop = _edges_from_keys(bm, self._base_loop_keys)
-        if not base_loop:
-            self.report({'ERROR'}, "Base loop is not valid")
-            _debug_log("invoke: cancelled (base loop invalid)")
-            return {'CANCELLED'}
-
-        neighbors = _neighbor_loops(bm, base_loop)
-        side_loops = []
-        for loop in neighbors:
-            if not _loop_is_boundary(loop):
-                side_loops.append(loop)
-            if len(side_loops) == 2:
-                break
-
-        self._left_loops_keys = []
-        self._right_loops_keys = []
-        for idx, first in enumerate(side_loops):
-            prev = base_loop
-            curr = first
-            while curr and not _loop_is_boundary(curr):
-                keys = _loop_keys(curr)
-                if idx == 0:
-                    self._left_loops_keys.append(keys)
-                else:
-                    self._right_loops_keys.append(keys)
-                nxt = _next_loop(bm, prev, curr)
-                prev, curr = curr, nxt
+        self._skip_loops = settings.skip_loops if settings else 2
 
         self.extend = 0
         _status(context, self._status_text())
         context.window_manager.modal_handler_add(self)
+        self.report({'INFO'}, "Loop Sculpt: started")
         _debug_log("invoke: running (base_loop_edges=%d valid=%s)" % (len(self._base_loop_keys), ok))
         return {'RUNNING_MODAL'}
 
@@ -291,37 +305,39 @@ class MESH_OT_loop_sculpt(Operator):
         base_loop = _edges_from_keys(bm, self._base_loop_keys)
         if not base_loop:
             return None
-
-        selected_loops = [base_loop]
-        if step == 0:
-            _debug_log("loops: step=0 sizes=[%d]" % len(base_loop))
-            return set(base_loop)
-
-        hop = self._skip_loops + 1
         edges = set(base_loop)
-        left = self._left_loops_keys
-        right = self._right_loops_keys
+        if step == 0:
+            return edges
+
+        hop = self._skip_loops
+        neighbors = _neighbor_loops(bm, base_loop)
+        if not neighbors:
+            return None
+
+        left = neighbors[0] if len(neighbors) > 0 else None
+        right = neighbors[1] if len(neighbors) > 1 else None
+
+        left_curr = left
+        right_curr = right
 
         for k in range(1, step + 1):
-            idx = k * hop - 1
-            if idx < len(left):
-                loop = _edges_from_keys(bm, left[idx])
-                if loop:
-                    edges.update(loop)
-            if idx < len(right):
-                loop = _edges_from_keys(bm, right[idx])
-                if loop:
-                    edges.update(loop)
-
+            if left_curr:
+                left_sel = _step_loop(bm, base_loop if k == 1 else left_curr, left_curr, hop)
+                if left_sel:
+                    edges.update(left_sel)
+                    left_curr = left_sel
+                else:
+                    left_curr = None
+            if right_curr:
+                right_sel = _step_loop(bm, base_loop if k == 1 else right_curr, right_curr, hop)
+                if right_sel:
+                    edges.update(right_sel)
+                    right_curr = right_sel
+                else:
+                    right_curr = None
         _debug_log(
-            "loops: skip=%d hop=%d base=%d left=%d right=%d step=%d" % (
-                self._skip_loops,
-                hop,
-                len(base_loop),
-                len(left),
-                len(right),
-                step,
-            )
+            "loops: step=%d sizes=%s" %
+            (step, [len(loop) for loop in [base_loop]])
         )
         return edges
 
@@ -339,20 +355,10 @@ class MESH_OT_loop_sculpt(Operator):
         return True
 
     def modal(self, context, event):
-        if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
+        if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS', 'WHEELINMOUSE'}:
             if context.area and context.area.type != 'VIEW_3D':
                 return {'RUNNING_MODAL'}
-            hop = self._skip_loops + 1
-            next_step = self.extend + 1
-            idx = next_step * hop - 1
-            left_ok = idx < len(self._left_loops_keys)
-            right_ok = idx < len(self._right_loops_keys)
-            if not left_ok and not right_ok:
-                if not self._notified_limit:
-                    self.report({'WARNING'}, "Reached border loop; cannot extend further")
-                    self._notified_limit = True
-                return {'RUNNING_MODAL'}
-            self.extend = next_step
+            self.extend += 1
             obj, bm = _active_bm(context)
             if not bm:
                 _debug_log("wheel up: cancelled (no edit mesh)")
@@ -361,17 +367,20 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
+                self.report({'WARNING'}, "Topology limits loop traversal; cannot extend further")
+                _debug_log("wheel up: blocked (topology limit)")
                 _clear_status(context)
+                self.extend = max(0, self.extend - 1)
                 return {'RUNNING_MODAL'}
             _status(context, self._status_text())
-            _debug_log("wheel up: extend=%d" % self.extend)
+            self.report({'INFO'}, f"extend={self.extend} step={self._skip_loops}")
+            _debug_log("wheel up: extend=%d added=%d" % (self.extend, self.extend))
             return {'RUNNING_MODAL'}
 
-        if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS'}:
+        if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS', 'WHEELOUTMOUSE'}:
             if context.area and context.area.type != 'VIEW_3D':
                 return {'RUNNING_MODAL'}
             self.extend = max(0, self.extend - 1)
-            self._notified_limit = False
             obj, bm = _active_bm(context)
             if not bm:
                 _debug_log("wheel down: cancelled (no edit mesh)")
@@ -380,12 +389,13 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
-                self.report({'WARNING'}, "Reached border loop; cannot shrink further")
-                _debug_log("wheel down: blocked (border)")
+                self.report({'WARNING'}, "Topology limits loop traversal; cannot shrink further")
+                _debug_log("wheel down: blocked (topology limit)")
                 _clear_status(context)
                 return {'RUNNING_MODAL'}
             _status(context, self._status_text())
-            _debug_log("wheel down: extend=%d" % self.extend)
+            self.report({'INFO'}, f"extend={self.extend} step={self._skip_loops}")
+            _debug_log("wheel down: extend=%d removed=%d" % (self.extend, self.extend))
             return {'RUNNING_MODAL'}
 
         if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'}:
