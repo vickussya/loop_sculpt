@@ -1,5 +1,6 @@
 ﻿import bpy
 import bmesh
+import mathutils
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy.props import IntProperty, PointerProperty
 
@@ -100,6 +101,55 @@ def _clear_status(context):
 def _settings_from_context(context):
     return getattr(context.scene, "loop_sculpt_settings", None)
 
+
+def _loop_centroid(edge_map, loop_keys):
+    total = None
+    count = 0
+    for key in loop_keys:
+        e = edge_map.get(key)
+        if not e:
+            continue
+        v1, v2 = e.verts
+        mid = (v1.co + v2.co) * 0.5
+        if total is None:
+            total = mid.copy()
+        else:
+            total += mid
+        count += 1
+    if total is None or count == 0:
+        return None
+    return total / count
+
+
+def _principal_axis(centroids):
+    if not centroids:
+        return mathutils.Vector((1.0, 0.0, 0.0))
+    mean = mathutils.Vector((0.0, 0.0, 0.0))
+    for c in centroids:
+        mean += c
+    mean /= len(centroids)
+    cov = mathutils.Matrix(((0.0, 0.0, 0.0),
+                            (0.0, 0.0, 0.0),
+                            (0.0, 0.0, 0.0)))
+    for c in centroids:
+        d = c - mean
+        cov[0][0] += d.x * d.x
+        cov[0][1] += d.x * d.y
+        cov[0][2] += d.x * d.z
+        cov[1][0] += d.y * d.x
+        cov[1][1] += d.y * d.y
+        cov[1][2] += d.y * d.z
+        cov[2][0] += d.z * d.x
+        cov[2][1] += d.z * d.y
+        cov[2][2] += d.z * d.z
+    axis = mathutils.Vector((1.0, 0.0, 0.0))
+    for _ in range(8):
+        axis = cov @ axis
+        if axis.length == 0.0:
+            return mathutils.Vector((1.0, 0.0, 0.0))
+        axis.normalize()
+    return axis
+
 def _validate_loop_edges(edges):
     if not edges or len(edges) < 2:
         return False, "selection too small"
@@ -177,6 +227,68 @@ def _neighbor_loop(bm, loop_edges):
     return valid[0]
 
 
+def _get_loop_from_seed_edge(bm, obj, area, region, window, seed_edge):
+    orig_keys = {_edge_key(e) for e in bm.edges if e.select}
+    _deselect_all(bm)
+    seed_edge.select = True
+    bm.select_history.clear()
+    bm.select_history.add(seed_edge)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    with bpy.context.temp_override(
+        window=window,
+        area=area,
+        region=region,
+        active_object=obj,
+        object=obj,
+    ):
+        bpy.ops.mesh.loop_multi_select(ring=False)
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+    loop_keys = {_edge_key(e) for e in bm.edges if e.select}
+
+    _deselect_all(bm)
+    edge_map = _edge_map(bm)
+    for key in orig_keys:
+        e = edge_map.get(key)
+        if e:
+            e.select = True
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    return loop_keys
+
+
+def _get_ring_edges_from_seed(bm, obj, area, region, window, seed_edge):
+    orig_keys = {_edge_key(e) for e in bm.edges if e.select}
+    _deselect_all(bm)
+    seed_edge.select = True
+    bm.select_history.clear()
+    bm.select_history.add(seed_edge)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    with bpy.context.temp_override(
+        window=window,
+        area=area,
+        region=region,
+        active_object=obj,
+        object=obj,
+    ):
+        bpy.ops.mesh.loop_multi_select(ring=True)
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+    ring_keys = {_edge_key(e) for e in bm.edges if e.select}
+
+    _deselect_all(bm)
+    edge_map = _edge_map(bm)
+    for key in orig_keys:
+        e = edge_map.get(key)
+        if e:
+            e.select = True
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    return ring_keys
+
+
 def _neighbor_loops(bm, loop_edges):
     candidates = set()
     for e in loop_edges:
@@ -226,6 +338,13 @@ def _next_loop(bm, prev_loop, curr_loop):
     return None
 
 
+def _edge_map(bm):
+    edge_map = {}
+    for e in bm.edges:
+        edge_map[_edge_key(e)] = e
+    return edge_map
+
+
 def _step_loop(bm, prev_loop, curr_loop, steps):
     prev = prev_loop
     curr = curr_loop
@@ -264,6 +383,9 @@ class MESH_OT_loop_sculpt(Operator):
         bm.edges.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
+        self._win = context.window
+        self._area = context.area
+        self._region = context.region
 
         selected_edges = [e for e in bm.edges if e.select]
         _debug_log(
@@ -290,6 +412,70 @@ class MESH_OT_loop_sculpt(Operator):
 
         settings = _settings_from_context(context)
         self._skip_loops = settings.skip_loops if settings else 2
+        self._notified_limit = False
+
+        base_loop = _edges_from_keys(bm, self._base_loop_keys)
+        if not base_loop:
+            self.report({'ERROR'}, "Base loop is not valid")
+            _debug_log("invoke: cancelled (base loop invalid)")
+            return {'CANCELLED'}
+
+        rep_edge = min(selected_edges, key=lambda e: e.index)
+        ring_keys = _get_ring_edges_from_seed(bm, obj, self._area, self._region, self._win, rep_edge)
+        if not ring_keys:
+            self.report({'ERROR'}, "Edge ring not found for base loop")
+            _debug_log("invoke: cancelled (ring not found)")
+            return {'CANCELLED'}
+
+        edge_map = _edge_map(bm)
+        unassigned = set(ring_keys)
+        loops = []
+        seen = set()
+        base_size = len(self._base_loop_keys)
+        while unassigned:
+            seed_key = next(iter(unassigned))
+            seed_edge = edge_map.get(seed_key)
+            if not seed_edge:
+                unassigned.remove(seed_key)
+                continue
+            loop_keys = _get_loop_from_seed_edge(bm, obj, self._area, self._region, self._win, seed_edge)
+            if not loop_keys:
+                break
+            if len(loop_keys) != base_size:
+                unassigned -= loop_keys
+                continue
+            key = frozenset(loop_keys)
+            if key in seen:
+                unassigned -= loop_keys
+                continue
+            seen.add(key)
+            loops.append(list(loop_keys))
+            unassigned -= loop_keys
+
+        if not loops:
+            self.report({'ERROR'}, "Could not extract loops from ring")
+            _debug_log("invoke: cancelled (no loops)")
+            return {'CANCELLED'}
+
+        centroids = [_loop_centroid(edge_map, loop) for loop in loops]
+        axis = _principal_axis([c for c in centroids if c is not None])
+        projections = []
+        for loop, c in zip(loops, centroids):
+            proj = c.dot(axis) if c is not None else 0.0
+            projections.append((proj, loop))
+        projections.sort(key=lambda x: x[0])
+        self._ordered_loops = [loop for _, loop in projections]
+
+        base_set = set(self._base_loop_keys)
+        self._base_index = -1
+        for i, loop in enumerate(self._ordered_loops):
+            if set(loop) == base_set:
+                self._base_index = i
+                break
+        if self._base_index < 0:
+            self.report({'ERROR'}, "Base loop not found in ordered loops")
+            _debug_log("invoke: cancelled (base not in ordered loops)")
+            return {'CANCELLED'}
 
         self.extend = 0
         _status(context, self._status_text())
@@ -302,43 +488,31 @@ class MESH_OT_loop_sculpt(Operator):
         return f"Loop Sculpt | Extend: {self.extend} | Skip: {self._skip_loops}"
 
     def _edges_for_step(self, bm, step):
-        base_loop = _edges_from_keys(bm, self._base_loop_keys)
-        if not base_loop:
+        if not hasattr(self, "_ordered_loops") or self._base_index < 0:
             return None
-        edges = set(base_loop)
+        edge_map = _edge_map(bm)
+        edges = set()
+
+        def add_loop(loop_keys):
+            for key in loop_keys:
+                e = edge_map.get(key)
+                if e:
+                    edges.add(e)
+
+        add_loop(self._ordered_loops[self._base_index])
         if step == 0:
             return edges
 
         hop = self._skip_loops
-        neighbors = _neighbor_loops(bm, base_loop)
-        if not neighbors:
-            return None
-
-        left = neighbors[0] if len(neighbors) > 0 else None
-        right = neighbors[1] if len(neighbors) > 1 else None
-
-        left_curr = left
-        right_curr = right
-
         for k in range(1, step + 1):
-            if left_curr:
-                left_sel = _step_loop(bm, base_loop if k == 1 else left_curr, left_curr, hop)
-                if left_sel:
-                    edges.update(left_sel)
-                    left_curr = left_sel
-                else:
-                    left_curr = None
-            if right_curr:
-                right_sel = _step_loop(bm, base_loop if k == 1 else right_curr, right_curr, hop)
-                if right_sel:
-                    edges.update(right_sel)
-                    right_curr = right_sel
-                else:
-                    right_curr = None
-        _debug_log(
-            "loops: step=%d sizes=%s" %
-            (step, [len(loop) for loop in [base_loop]])
-        )
+            idx_pos = self._base_index + k * hop
+            idx_neg = self._base_index - k * hop
+            if 0 <= idx_pos < len(self._ordered_loops):
+                add_loop(self._ordered_loops[idx_pos])
+            if 0 <= idx_neg < len(self._ordered_loops):
+                add_loop(self._ordered_loops[idx_neg])
+
+        _debug_log("loops: step=%d total=%d" % (step, len(edges)))
         return edges
 
     def _update_preview(self, context, bm):
@@ -358,7 +532,16 @@ class MESH_OT_loop_sculpt(Operator):
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS', 'WHEELINMOUSE'}:
             if context.area and context.area.type != 'VIEW_3D':
                 return {'RUNNING_MODAL'}
-            self.extend += 1
+            hop = self._skip_loops
+            next_step = self.extend + 1
+            idx_pos = self._base_index + next_step * hop
+            idx_neg = self._base_index - next_step * hop
+            if idx_pos >= len(self._ordered_loops) and idx_neg < 0:
+                if not self._notified_limit:
+                    self.report({'INFO'}, "Reached end")
+                    self._notified_limit = True
+                return {'RUNNING_MODAL'}
+            self.extend = next_step
             obj, bm = _active_bm(context)
             if not bm:
                 _debug_log("wheel up: cancelled (no edit mesh)")
@@ -381,6 +564,8 @@ class MESH_OT_loop_sculpt(Operator):
             if context.area and context.area.type != 'VIEW_3D':
                 return {'RUNNING_MODAL'}
             self.extend = max(0, self.extend - 1)
+            if self.extend == 0:
+                self._notified_limit = False
             obj, bm = _active_bm(context)
             if not bm:
                 _debug_log("wheel down: cancelled (no edit mesh)")
