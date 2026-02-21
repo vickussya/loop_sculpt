@@ -505,7 +505,7 @@ class MESH_OT_loop_sculpt(Operator):
 
         skip = max(1, int(self._skip_loops))
         for dist in range(1, step + 1):
-            if dist % skip != 0:
+            if (dist - 1) % skip != 0:
                 continue
             idx_pos = self._base_index + dist
             idx_neg = self._base_index - dist
