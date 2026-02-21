@@ -1,9 +1,7 @@
 import bpy
 import bmesh
-import math
-import mathutils
 from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import BoolProperty, IntProperty, PointerProperty, FloatProperty
+from bpy.props import IntProperty, PointerProperty
 
 
 def _active_bm(context):
@@ -32,23 +30,25 @@ def _edge_key(edge):
     return (a, b) if a < b else (b, a)
 
 
-def _edge_by_key(bm):
-    edge_map = {}
-    for e in bm.edges:
-        v1, v2 = e.verts
-        a = v1.index
-        b = v2.index
-        key = (a, b) if a < b else (b, a)
-        edge_map[key] = e
-    return edge_map
+def _edge_from_key(bm, key):
+    a, b = key
+    if a >= len(bm.verts) or b >= len(bm.verts):
+        return None
+    v1 = bm.verts[a]
+    v2 = bm.verts[b]
+    for e in v1.link_edges:
+        if v2 in e.verts:
+            return e
+    return None
 
 
-def _edges_from_keys(edge_map, keys):
-    edges = []
+def _edges_from_keys(bm, keys):
+    edges = set()
     for key in keys:
-        e = edge_map.get(key)
-        if e:
-            edges.append(e)
+        e = _edge_from_key(bm, key)
+        if not e:
+            return None
+        edges.add(e)
     return edges
 
 
@@ -56,53 +56,22 @@ def _loop_keys(edges):
     return {_edge_key(e) for e in edges}
 
 
-def _loop_centroid_from_keys(edge_map, loop_keys):
-    total = None
-    count = 0
-    for key in loop_keys:
-        e = edge_map.get(key)
-        if not e:
+def _opposite_edge_in_face(face, edge):
+    v1, v2 = edge.verts
+    for e in face.edges:
+        if e is edge:
             continue
-        v1, v2 = e.verts
-        mid = (v1.co + v2.co) * 0.5
-        if total is None:
-            total = mid.copy()
-        else:
-            total += mid
-        count += 1
-    if total is None or count == 0:
-        return None
-    return total / count
+        if (v1 in e.verts) or (v2 in e.verts):
+            continue
+        return e
+    return None
 
 
-def _principal_axis(centroids):
-    if not centroids:
-        return mathutils.Vector((1.0, 0.0, 0.0))
-    mean = mathutils.Vector((0.0, 0.0, 0.0))
-    for c in centroids:
-        mean += c
-    mean /= len(centroids)
-    cov = mathutils.Matrix(((0.0, 0.0, 0.0),
-                            (0.0, 0.0, 0.0),
-                            (0.0, 0.0, 0.0)))
-    for c in centroids:
-        d = c - mean
-        cov[0][0] += d.x * d.x
-        cov[0][1] += d.x * d.y
-        cov[0][2] += d.x * d.z
-        cov[1][0] += d.y * d.x
-        cov[1][1] += d.y * d.y
-        cov[1][2] += d.y * d.z
-        cov[2][0] += d.z * d.x
-        cov[2][1] += d.z * d.y
-        cov[2][2] += d.z * d.z
-    axis = mathutils.Vector((1.0, 0.0, 0.0))
-    for _ in range(8):
-        axis = cov @ axis
-        if axis.length == 0.0:
-            return mathutils.Vector((1.0, 0.0, 0.0))
-        axis.normalize()
-    return axis
+def _is_border_loop(loop_edges):
+    for e in loop_edges:
+        if len(e.link_faces) < 2:
+            return True
+    return False
 
 
 def _deselect_all(bm):
@@ -176,185 +145,62 @@ def _validate_loop_edges(edges):
     return True, ""
 
 
-def _is_boundary_edge(edge):
-    return len(edge.link_faces) != 2
-
-
-def _edge_dihedral_deg(edge):
-    if len(edge.link_faces) != 2:
-        return 180.0
-    f1, f2 = edge.link_faces
-    f1.normal_update()
-    f2.normal_update()
-    dot = f1.normal.dot(f2.normal)
-    if dot > 1.0:
-        dot = 1.0
-    elif dot < -1.0:
-        dot = -1.0
-    return math.degrees(math.acos(dot))
-
-
-def _is_protected_edge(edge, protect_angle_deg):
-    if _is_boundary_edge(edge):
-        return True
-    if getattr(edge, "use_edge_sharp", False):
-        return True
-    if getattr(edge, "seam", False):
-        return True
-    if _edge_dihedral_deg(edge) >= protect_angle_deg:
-        return True
-    return False
-
-
-def _loop_is_protected(loop_keys, edge_map, protect_angle_deg):
-    for key in loop_keys:
-        e = edge_map.get(key)
-        if e and _is_protected_edge(e, protect_angle_deg):
-            return True
-    return False
-
-
-def _sample_protected(loop_keys, edge_map, protect_angle_deg, max_items=5):
-    edges = []
-    angles = []
-    for key in loop_keys:
-        e = edge_map.get(key)
-        if not e:
-            continue
-        if _is_protected_edge(e, protect_angle_deg):
-            edges.append(e.index)
-            angles.append(_edge_dihedral_deg(e))
-            if len(edges) >= max_items:
-                break
-    return edges, angles
-
-
-def _get_loop_from_seed_edge(bm, obj, area, region, window, seed_edge):
-    original = {e for e in bm.edges if e.select}
-    _deselect_all(bm)
-    seed_edge.select = True
-    bm.select_history.clear()
-    bm.select_history.add(seed_edge)
-    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-
-    with bpy.context.temp_override(
-        window=window,
-        area=area,
-        region=region,
-        active_object=obj,
-        object=obj,
-    ):
-        bpy.ops.mesh.loop_multi_select(ring=False)
-
-    bm = bmesh.from_edit_mesh(obj.data)
-    bm.edges.ensure_lookup_table()
-    loop = {e for e in bm.edges if e.select}
-
-    _deselect_all(bm)
-    for e in original:
-        if e.is_valid:
-            e.select = True
-    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-    return loop
-
-
-def _get_ring_edges_from_seed(bm, obj, area, region, window, seed_edge):
-    original = {e for e in bm.edges if e.select}
-    _deselect_all(bm)
-    seed_edge.select = True
-    bm.select_history.clear()
-    bm.select_history.add(seed_edge)
-    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-
-    with bpy.context.temp_override(
-        window=window,
-        area=area,
-        region=region,
-        active_object=obj,
-        object=obj,
-    ):
-        bpy.ops.mesh.loop_multi_select(ring=True)
-
-    bm = bmesh.from_edit_mesh(obj.data)
-    bm.edges.ensure_lookup_table()
-    ring_edges = {e for e in bm.edges if e.select}
-
-    _deselect_all(bm)
-    for e in original:
-        if e.is_valid:
-            e.select = True
-    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-    return ring_edges
-
-
-def _edges_share_ring_vertices(loop_edges, ring_edges):
-    ring_verts = set()
-    for e in ring_edges:
-        ring_verts.update(e.verts)
+def _neighbor_loops(bm, loop_edges):
+    candidates = set()
     for e in loop_edges:
-        for v in e.verts:
-            if v in ring_verts:
-                return True
-    return False
+        for f in e.link_faces:
+            if len(f.verts) != 4:
+                continue
+            opp = _opposite_edge_in_face(f, e)
+            if opp:
+                candidates.add(opp)
+    if not candidates:
+        return []
+    components = []
+    remaining = set(candidates)
+    while remaining:
+        start = next(iter(remaining))
+        comp = {start}
+        stack = [start]
+        remaining.remove(start)
+        while stack:
+            cur = stack.pop()
+            for v in cur.verts:
+                for le in v.link_edges:
+                    if le in remaining:
+                        remaining.remove(le)
+                        comp.add(le)
+                        stack.append(le)
+        components.append(comp)
+    valid = []
+    for comp in components:
+        ok, _reason = _validate_loop_edges(comp)
+        if ok and not _is_border_loop(comp):
+            valid.append(comp)
+    valid.sort(key=lambda c: sorted(_loop_keys(c))[0])
+    return valid
 
 
-def _rep_edge_from_keys(edge_map, loop_keys):
-    for key in loop_keys:
-        e = edge_map.get(key)
-        if e:
-            return e
-    return None
-
-
-def _pick_side_face(edge, target_normal):
-    best = None
-    best_dot = -2.0
-    for f in edge.link_faces:
-        if len(f.verts) != 4:
-            continue
-        f.normal_update()
-        dot = f.normal.dot(target_normal)
-        if dot > best_dot:
-            best_dot = dot
-            best = f
-    return best
-
-
-def _opposite_edge_in_face(face, edge):
-    for e in face.edges:
-        if e is edge:
-            continue
-        if e.verts[0] not in edge.verts and e.verts[1] not in edge.verts:
-            return e
-    return None
-
-
-def _loop_from_seed_keys(bm, obj, area, region, window, seed_edge):
-    loop = _get_loop_from_seed_edge(bm, obj, area, region, window, seed_edge)
-    if not loop:
+def _next_loop(bm, prev_loop, curr_loop):
+    neighbors = _neighbor_loops(bm, curr_loop)
+    if not neighbors:
         return None
-    return set(_loop_keys(loop))
+    if not prev_loop:
+        return neighbors[0]
+    prev_keys = _loop_keys(prev_loop)
+    for loop in neighbors:
+        if _loop_keys(loop) != prev_keys:
+            return loop
+    return None
 
 
 class LoopSculptSettings(PropertyGroup):
-    skip_loops: int = IntProperty(
+    skip_loops: IntProperty(
         name="Skip Loops",
         description="Number of loops to skip between selected loops",
         default=1,
         min=1,
         max=5,
-    )
-    protect_angle_deg: float = FloatProperty(
-        name="Protect Angle",
-        description="Edges with face angle >= this value are treated as silhouette and will not be selected",
-        default=45,
-        min=1,
-        max=89,
-    )
-    disable_protection: bool = BoolProperty(
-        name="Disable Protection (Debug)",
-        description="Ignore silhouette protection for debugging",
-        default=False,
     )
 
 
@@ -363,88 +209,7 @@ class MESH_OT_loop_sculpt(Operator):
     bl_label = "Loop Sculpt"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
-    extend: int = IntProperty(default=0, min=0)
-
-    def _loop_is_protected_keys(self, loop_keys, edge_map):
-        if self._disable_protection:
-            return False
-        for key in loop_keys:
-            e = edge_map.get(key)
-            if not e:
-                continue
-            if _is_boundary_edge(e):
-                return True
-            if getattr(e, "use_edge_sharp", False) or getattr(e, "seam", False):
-                return True
-            if _edge_dihedral_deg(e) >= self._protect_angle_deg:
-                return True
-        return False
-
-    def _step_adjacent_loop(self, bm, obj, edge_map, current_keys, side_normal):
-        rep = _rep_edge_from_keys(edge_map, current_keys)
-        if not rep:
-            return None
-        face = _pick_side_face(rep, side_normal)
-        if not face:
-            return None
-        opp = _opposite_edge_in_face(face, rep)
-        if not opp:
-            return None
-        next_keys = _loop_from_seed_keys(bm, obj, self._area, self._region, self._win, opp)
-        if not next_keys:
-            return None
-        if len(next_keys) != self._base_loop_size:
-            return None
-        if next_keys == current_keys:
-            return None
-        return next_keys
-
-    def _build_side_loops(self, bm, obj, edge_map, side_normal):
-        loops = []
-        seen = set()
-        current = set(self._base_loop_keys)
-        while True:
-            bm = bmesh.from_edit_mesh(obj.data)
-            bm.verts.ensure_lookup_table()
-            bm.edges.ensure_lookup_table()
-            bm.faces.ensure_lookup_table()
-            edge_map = _edge_by_key(bm)
-            next_keys = self._step_adjacent_loop(bm, obj, edge_map, current, side_normal)
-            if not next_keys:
-                break
-            key = frozenset(next_keys)
-            if key in seen:
-                break
-            seen.add(key)
-            if self._loop_is_protected_keys(next_keys, edge_map):
-                break
-            loops.append(list(next_keys))
-            current = next_keys
-        return loops
-
-    def _apply_selection(self, bm, obj):
-        hop = self._skip_loops + 1
-        edge_map = _edge_by_key(bm)
-        _deselect_all(bm)
-        # Base loop always selected.
-        for key in self._base_loop_keys:
-            e = edge_map.get(key)
-            if e:
-                e.select = True
-        # Add stepped loops symmetrically.
-        for k in range(1, self._step_count + 1):
-            idx = k * hop - 1
-            if idx < len(self._left_loops):
-                for key in self._left_loops[idx]:
-                    e = edge_map.get(key)
-                    if e:
-                        e.select = True
-            if idx < len(self._right_loops):
-                for key in self._right_loops[idx]:
-                    e = edge_map.get(key)
-                    if e:
-                        e.select = True
-        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    extend: IntProperty(default=0, min=0)
 
     def invoke(self, context, event):
         obj, bm = _active_bm(context)
@@ -453,18 +218,14 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("invoke: cancelled (no edit mesh)")
             return {'CANCELLED'}
 
-        self._win = context.window
-        self._area = context.area
-        self._region = context.region
-
         bm.edges.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
 
         selected_edges = [e for e in bm.edges if e.select]
         _debug_log(
-            "invoke: mode=%s area=%s region=%s selected_edges=%d" %
-            (context.mode, self._area.type if self._area else None, self._region.type if self._region else None, len(selected_edges))
+            "invoke: mode=%s obj=%s selected_edges=%d" %
+            (context.mode, obj.name if obj else "None", len(selected_edges))
         )
         if len(selected_edges) < 2:
             self.report({'ERROR'}, "Select a full edge loop (at least 2 edges)")
@@ -477,8 +238,7 @@ class MESH_OT_loop_sculpt(Operator):
             _debug_log("invoke: cancelled (selection invalid: %s)" % reason)
             return {'CANCELLED'}
 
-        self._base_loop_keys = list(_loop_keys(selected_edges))
-        self._base_loop_size = len(self._base_loop_keys)
+        self._base_loop_keys = _loop_keys(selected_edges)
         self._orig_sel = {
             'edges': {e for e in bm.edges if e.select},
             'verts': {v for v in bm.verts if v.select},
@@ -487,120 +247,125 @@ class MESH_OT_loop_sculpt(Operator):
 
         settings = _settings_from_context(context)
         self._skip_loops = settings.skip_loops if settings else 1
-        self._protect_angle_deg = settings.protect_angle_deg if settings else 45
-        self._disable_protection = settings.disable_protection if settings else False
-
-        base_rep = min(selected_edges, key=lambda e: e.index) if selected_edges else None
-        if not base_rep:
-            self.report({'ERROR'}, "No representative edge found")
-            return {'CANCELLED'}
-
-        quad_faces = [f for f in base_rep.link_faces if len(f.verts) == 4]
-        if not quad_faces:
-            self.report({'ERROR'}, "Base loop has no quad faces to step across")
-            return {'CANCELLED'}
-        if len(quad_faces) < 2:
-            self.report({'WARNING'}, "Only one side available for expansion")
-
-        edge_map = _edge_by_key(bm)
-        left_normal = quad_faces[0].normal.copy()
-        right_normal = quad_faces[1].normal.copy() if len(quad_faces) > 1 else quad_faces[0].normal.copy()
-
-        self._left_loops = self._build_side_loops(bm, obj, edge_map, left_normal)
-        self._right_loops = self._build_side_loops(bm, obj, edge_map, right_normal)
-
-        self._step_count = 0
-        self._notified_limit = False
 
         self.extend = 0
         _status(context, self._status_text())
         context.window_manager.modal_handler_add(self)
-        _debug_log("invoke: base_loop_edges=%d left_loops=%d right_loops=%d" % (
-            len(self._base_loop_keys), len(self._left_loops), len(self._right_loops)))
+        _debug_log("invoke: running (base_loop_edges=%d valid=%s)" % (len(self._base_loop_keys), ok))
         return {'RUNNING_MODAL'}
 
     def _status_text(self):
         return f"Loop Sculpt | Extend: {self.extend} | Skip: {self._skip_loops}"
 
-    def _select_loops_by_step(self, bm, obj, event_name):
+    def _edges_for_step(self, bm, step):
+        base_loop = _edges_from_keys(bm, self._base_loop_keys)
+        if not base_loop:
+            return None
+
+        selected_loops = [base_loop]
+        if step == 0:
+            _debug_log("loops: step=0 sizes=[%d]" % len(base_loop))
+            return set(base_loop)
+
         hop = self._skip_loops + 1
-        step_count = self._step_count
+        side_loops = _neighbor_loops(bm, base_loop)
+        blocked_a = False
+        blocked_b = False
 
-        _debug_log("event: %s" % event_name)
-        _debug_log("hop=%d step_count=%d" % (hop, step_count))
-        _debug_log("base_i=0 total_loops_left=%d total_loops_right=%d" % (
-            len(self._left_loops), len(self._right_loops)))
+        for side_index in range(2):
+            if side_index >= len(side_loops):
+                if side_index == 0:
+                    blocked_a = True
+                else:
+                    blocked_b = True
+                continue
+            prev = base_loop
+            curr = side_loops[side_index]
+            target_dist = hop * step
+            for _dist in range(1, target_dist):
+                nxt = _next_loop(bm, prev, curr)
+                if not nxt:
+                    curr = None
+                    break
+                prev, curr = curr, nxt
+            if not curr:
+                if side_index == 0:
+                    blocked_a = True
+                else:
+                    blocked_b = True
+                continue
+            if _is_border_loop(curr):
+                if side_index == 0:
+                    blocked_a = True
+                else:
+                    blocked_b = True
+                continue
+            selected_loops.append(curr)
 
-        intended = [k * hop - 1 for k in range(1, step_count + 1)]
-        selected = []
-        blocked = []
-        for k in range(1, step_count + 1):
-            idx = k * hop - 1
-            left_ok = idx < len(self._left_loops)
-            right_ok = idx < len(self._right_loops)
-            if left_ok:
-                selected.append(("L", idx))
-            else:
-                blocked.append(("L", idx, "out_of_range"))
-            if right_ok:
-                selected.append(("R", idx))
-            else:
-                blocked.append(("R", idx, "out_of_range"))
+        edges = set()
+        for loop in selected_loops:
+            edges.update(loop)
+        _debug_log(
+            "loops: step=%d sizes=%s" %
+            (step, [len(loop) for loop in selected_loops])
+        )
+        if blocked_a and blocked_b:
+            return None
+        return edges
 
-        _debug_log("intended_indices=%s" % intended)
-        _debug_log("selected_indices=%s" % selected)
-        for side, idx, reason in blocked:
-            _debug_log("blocked %s idx=%d reason=%s" % (side, idx, reason))
-
-        self._apply_selection(bm, obj)
+    def _update_preview(self, context, bm):
+        edges = self._edges_for_step(bm, self.extend)
+        if edges is None:
+            return False
+        if not edges:
+            return True
+        _deselect_all(bm)
+        for e in edges:
+            if e.is_valid:
+                e.select = True
+        bmesh.update_edit_mesh(context.active_object.data, loop_triangles=False, destructive=False)
         return True
 
     def modal(self, context, event):
-        if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'LEFTMOUSE', 'ESC', 'RIGHTMOUSE'}:
-            _debug_log("EVENT: %s %s" % (event.type, event.value))
-
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
+            if context.area and context.area.type != 'VIEW_3D':
+                return {'RUNNING_MODAL'}
+            self.extend += 1
             obj, bm = _active_bm(context)
             if not bm:
-                self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
-                return {'RUNNING_MODAL'}
-            bm.verts.ensure_lookup_table()
+                _debug_log("wheel up: cancelled (no edit mesh)")
+                return {'CANCELLED'}
             bm.edges.ensure_lookup_table()
-            bm.faces.ensure_lookup_table()
-            hop = self._skip_loops + 1
-            next_step = self._step_count + 1
-            idx = next_step * hop - 1
-            left_ok = idx < len(self._left_loops)
-            right_ok = idx < len(self._right_loops)
-            if not left_ok and not right_ok:
-                if not self._notified_limit:
-                    self.report({'INFO'}, "Reached silhouette; further expansion blocked on one or both sides.")
-                    self._notified_limit = True
-                return {'RUNNING_MODAL'}
-            self._step_count = next_step
-            obj, bm = _active_bm(context)
-            if not bm:
-                self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
-                return {'RUNNING_MODAL'}
             bm.verts.ensure_lookup_table()
-            bm.edges.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            self._select_loops_by_step(bm, obj, "WHEELUP")
+            if not self._update_preview(context, bm):
+                self.report({'WARNING'}, "Reached border loop; cannot extend further")
+                _debug_log("wheel up: blocked (border)")
+                _clear_status(context)
+                self.extend = max(0, self.extend - 1)
+                return {'RUNNING_MODAL'}
             _status(context, self._status_text())
+            _debug_log("wheel up: extend=%d" % self.extend)
             return {'RUNNING_MODAL'}
 
         if event.type in {'WHEELDOWNMOUSE', 'NUMPAD_MINUS'}:
-            self._step_count = max(0, self._step_count - 1)
-            self._notified_limit = False
+            if context.area and context.area.type != 'VIEW_3D':
+                return {'RUNNING_MODAL'}
+            self.extend = max(0, self.extend - 1)
             obj, bm = _active_bm(context)
             if not bm:
-                self.report({'INFO'}, "Hover viewport + stay in Edit Mode")
-                return {'RUNNING_MODAL'}
-            bm.verts.ensure_lookup_table()
+                _debug_log("wheel down: cancelled (no edit mesh)")
+                return {'CANCELLED'}
             bm.edges.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
-            self._select_loops_by_step(bm, obj, "WHEELDOWN")
+            if not self._update_preview(context, bm):
+                self.report({'WARNING'}, "Reached border loop; cannot shrink further")
+                _debug_log("wheel down: blocked (border)")
+                _clear_status(context)
+                return {'RUNNING_MODAL'}
             _status(context, self._status_text())
+            _debug_log("wheel down: extend=%d" % self.extend)
             return {'RUNNING_MODAL'}
 
         if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'}:
@@ -612,14 +377,11 @@ class MESH_OT_loop_sculpt(Operator):
         if event.type in {'RIGHTMOUSE', 'ESC'}:
             obj, bm = _active_bm(context)
             if bm:
-                edge_map = _edge_by_key(bm)
-                base_loop = self._base_loop_keys
+                base_loop = _edges_from_keys(bm, self._base_loop_keys)
                 if base_loop:
                     _deselect_all(bm)
-                    for key in base_loop:
-                        e = edge_map.get(key)
-                        if e:
-                            e.select = True
+                    for e in base_loop:
+                        e.select = True
                     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
                 else:
                     _restore_selection(bm, self._orig_sel)
@@ -650,8 +412,6 @@ class VIEW3D_PT_loop_sculpt(Panel):
         layout.operator(MESH_OT_loop_sculpt.bl_idname, text="Loop Sculpt")
         if settings:
             layout.prop(settings, "skip_loops")
-            layout.prop(settings, "protect_angle_deg")
-            layout.prop(settings, "disable_protection")
 
 
 def register():
