@@ -67,11 +67,12 @@ def _opposite_edge_in_face(face, edge):
     return None
 
 
-def _is_border_loop(loop_edges):
-    for e in loop_edges:
-        if len(e.link_faces) < 2:
-            return True
-    return False
+def _is_boundary_edge(edge):
+    return len(edge.link_faces) != 2
+
+
+def _loop_is_boundary(loop_edges):
+    return any(_is_boundary_edge(e) for e in loop_edges)
 
 
 def _deselect_all(bm):
@@ -175,7 +176,7 @@ def _neighbor_loops(bm, loop_edges):
     valid = []
     for comp in components:
         ok, _reason = _validate_loop_edges(comp)
-        if ok and not _is_border_loop(comp):
+        if ok:
             valid.append(comp)
     valid.sort(key=lambda c: sorted(_loop_keys(c))[0])
     return valid
@@ -198,7 +199,7 @@ class LoopSculptSettings(PropertyGroup):
     skip_loops: IntProperty(
         name="Skip Loops",
         description="Number of loops to skip between selected loops",
-        default=1,
+        default=2,
         min=1,
         max=5,
     )
@@ -247,6 +248,35 @@ class MESH_OT_loop_sculpt(Operator):
 
         settings = _settings_from_context(context)
         self._skip_loops = settings.skip_loops if settings else 1
+        self._notified_limit = False
+
+        base_loop = _edges_from_keys(bm, self._base_loop_keys)
+        if not base_loop:
+            self.report({'ERROR'}, "Base loop is not valid")
+            _debug_log("invoke: cancelled (base loop invalid)")
+            return {'CANCELLED'}
+
+        neighbors = _neighbor_loops(bm, base_loop)
+        side_loops = []
+        for loop in neighbors:
+            if not _loop_is_boundary(loop):
+                side_loops.append(loop)
+            if len(side_loops) == 2:
+                break
+
+        self._left_loops_keys = []
+        self._right_loops_keys = []
+        for idx, first in enumerate(side_loops):
+            prev = base_loop
+            curr = first
+            while curr and not _loop_is_boundary(curr):
+                keys = _loop_keys(curr)
+                if idx == 0:
+                    self._left_loops_keys.append(keys)
+                else:
+                    self._right_loops_keys.append(keys)
+                nxt = _next_loop(bm, prev, curr)
+                prev, curr = curr, nxt
 
         self.extend = 0
         _status(context, self._status_text())
@@ -268,49 +298,31 @@ class MESH_OT_loop_sculpt(Operator):
             return set(base_loop)
 
         hop = self._skip_loops + 1
-        side_loops = _neighbor_loops(bm, base_loop)
-        blocked_a = False
-        blocked_b = False
+        edges = set(base_loop)
+        left = self._left_loops_keys
+        right = self._right_loops_keys
 
-        for side_index in range(2):
-            if side_index >= len(side_loops):
-                if side_index == 0:
-                    blocked_a = True
-                else:
-                    blocked_b = True
-                continue
-            prev = base_loop
-            curr = side_loops[side_index]
-            target_dist = hop * step
-            for _dist in range(1, target_dist):
-                nxt = _next_loop(bm, prev, curr)
-                if not nxt:
-                    curr = None
-                    break
-                prev, curr = curr, nxt
-            if not curr:
-                if side_index == 0:
-                    blocked_a = True
-                else:
-                    blocked_b = True
-                continue
-            if _is_border_loop(curr):
-                if side_index == 0:
-                    blocked_a = True
-                else:
-                    blocked_b = True
-                continue
-            selected_loops.append(curr)
+        for k in range(1, step + 1):
+            idx = k * hop - 1
+            if idx < len(left):
+                loop = _edges_from_keys(bm, left[idx])
+                if loop:
+                    edges.update(loop)
+            if idx < len(right):
+                loop = _edges_from_keys(bm, right[idx])
+                if loop:
+                    edges.update(loop)
 
-        edges = set()
-        for loop in selected_loops:
-            edges.update(loop)
         _debug_log(
-            "loops: step=%d sizes=%s" %
-            (step, [len(loop) for loop in selected_loops])
+            "loops: skip=%d hop=%d base=%d left=%d right=%d step=%d" % (
+                self._skip_loops,
+                hop,
+                len(base_loop),
+                len(left),
+                len(right),
+                step,
+            )
         )
-        if blocked_a and blocked_b:
-            return None
         return edges
 
     def _update_preview(self, context, bm):
@@ -330,7 +342,17 @@ class MESH_OT_loop_sculpt(Operator):
         if event.type in {'WHEELUPMOUSE', 'NUMPAD_PLUS'}:
             if context.area and context.area.type != 'VIEW_3D':
                 return {'RUNNING_MODAL'}
-            self.extend += 1
+            hop = self._skip_loops + 1
+            next_step = self.extend + 1
+            idx = next_step * hop - 1
+            left_ok = idx < len(self._left_loops_keys)
+            right_ok = idx < len(self._right_loops_keys)
+            if not left_ok and not right_ok:
+                if not self._notified_limit:
+                    self.report({'WARNING'}, "Reached border loop; cannot extend further")
+                    self._notified_limit = True
+                return {'RUNNING_MODAL'}
+            self.extend = next_step
             obj, bm = _active_bm(context)
             if not bm:
                 _debug_log("wheel up: cancelled (no edit mesh)")
@@ -339,10 +361,7 @@ class MESH_OT_loop_sculpt(Operator):
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             if not self._update_preview(context, bm):
-                self.report({'WARNING'}, "Reached border loop; cannot extend further")
-                _debug_log("wheel up: blocked (border)")
                 _clear_status(context)
-                self.extend = max(0, self.extend - 1)
                 return {'RUNNING_MODAL'}
             _status(context, self._status_text())
             _debug_log("wheel up: extend=%d" % self.extend)
@@ -352,6 +371,7 @@ class MESH_OT_loop_sculpt(Operator):
             if context.area and context.area.type != 'VIEW_3D':
                 return {'RUNNING_MODAL'}
             self.extend = max(0, self.extend - 1)
+            self._notified_limit = False
             obj, bm = _active_bm(context)
             if not bm:
                 _debug_log("wheel down: cancelled (no edit mesh)")
