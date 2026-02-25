@@ -249,7 +249,7 @@ class LoopSculptSettings(PropertyGroup):
     skip_loops: IntProperty(
         name="Skip Loops",
         description="Number of loops to skip between selected loops (1 = every other loop)",
-        default=2,
+        default=1,
         min=1,
         max=5,
     )
