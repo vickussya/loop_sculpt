@@ -246,7 +246,7 @@ def _step_loop(bm, prev_loop, curr_loop, steps):
 
 
 class LoopSculptSettings(PropertyGroup):
-    skip_loops: IntProperty(
+    skip_loops: int = IntProperty(
         name="Skip Loops",
         description="Number of loops to skip between selected loops (1 = every other loop)",
         default=1,
@@ -260,7 +260,7 @@ class MESH_OT_loop_sculpt(Operator):
     bl_label = "Loop Sculpt"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
-    extend: IntProperty(default=0, min=0)
+    extend: int = IntProperty(default=0, min=0)
 
     def invoke(self, context, event):
         obj, bm = _active_bm(context)
