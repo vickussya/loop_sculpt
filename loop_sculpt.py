@@ -248,7 +248,7 @@ def _step_loop(bm, prev_loop, curr_loop, steps):
 class LoopSculptSettings(PropertyGroup):
     skip_loops: IntProperty(
         name="Skip Loops",
-        description="Select every Nth loop (skip N-1 in between)",
+        description="Number of loops to skip between selected loops (1 = every other loop)",
         default=2,
         min=1,
         max=5,
@@ -362,8 +362,9 @@ class MESH_OT_loop_sculpt(Operator):
             return edges
 
         skip = max(1, int(self._skip_loops))
+        hop = skip + 1
         for dist in range(1, step + 1):
-            if (dist - 1) % skip != 0:
+            if dist % hop != 0:
                 continue
             idx = dist - 1
             if idx < len(self._left_rings):

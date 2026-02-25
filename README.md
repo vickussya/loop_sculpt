@@ -26,10 +26,10 @@ Loop Sculpt is a selection-only Blender add-on for stepping edge loop selection 
 6. Cancel with **Esc** or **Right Mouse** (selection returns to the original loop).
 
 ## Options
-- **Skip Loops (1-5)**: selects every Nth loop starting from the first neighbor (default: 2).
-  - Skip=1: distances 1,2,3...
-  - Skip=2: distances 1,3,5...
-  - Skip=3: distances 1,4,7...
+- **Skip Loops (1-5)**: number of loops to skip between selected loops (default: 2).
+  - Skip=1: selects every other loop (distances 2,4,6...).
+  - Skip=2: selects every third loop (distances 3,6,9...).
+  - Skip=3: selects every fourth loop (distances 4,8,12...).
 
 ## Notes
 - Best on quad-based topology.
